@@ -1,0 +1,17 @@
+name: "@miris-inc/voxel51"
+type: plugin
+author: Miris Inc.
+version: 2.1.0
+description: >
+  Syncs Miris assets into FiftyOne datasets. Rendering of the `MirisStream`
+  fo3d node type is provided by FiftyOne core (looker-3d); this plugin
+  exposes a sync operator that fetches available Miris assets and creates
+  samples backed by a `.fo3d` scene per asset.
+url: https://miris.com
+license: Apache-2.0
+fiftyone:
+  version: ">=1.0"
+js_bundle: js/dist/index.umd.js
+operators:
+  - upsert_miris_asset
+  - sync_miris_assets

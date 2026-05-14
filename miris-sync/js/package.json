@@ -1,0 +1,40 @@
+{
+  "name": "@miris-inc/voxel51",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.tsx",
+  "fiftyone": {
+    "script": "dist/index.umd.js"
+  },
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@miris-inc/three": "latest"
+  },
+  "peerDependencies": {
+    "@fiftyone/operators": "*",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "three": "^0.182.0"
+  },
+  "peerDependenciesMeta": {
+    "@fiftyone/operators": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@types/three": "^0.176.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "three": "^0.182.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0",
+    "vite-plugin-externalize-deps": "^0.10.0"
+  }
+}
