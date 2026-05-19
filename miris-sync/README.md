@@ -40,7 +40,34 @@ yarn build
 
 The build produces `js/dist/index.umd.js` (~14 MB, dominated by the Miris WASM runtime). React, Three.js, and `@fiftyone/*` are externalized against FiftyOne's runtime globals — only `@miris-inc/three` is bundled.
 
-### 3. Launch FiftyOne
+### 3. Install Python dependencies
+
+The plugin ships a `requirements.txt` listing the Python packages needed by its
+operators (numpy, opencv for `visual_hull`; plus torch, transformers, sam2,
+scikit-learn, …  for `dino_sam2`). Install them into the **same Python env that
+runs FiftyOne** using FiftyOne's built-in helper:
+
+```bash
+fiftyone plugins requirements @miris-inc/voxel51 --install
+```
+
+Variants:
+
+| Command | Purpose |
+|---|---|
+| `fiftyone plugins requirements @miris-inc/voxel51 --print`   | Show the requirements file without touching the env. |
+| `fiftyone plugins requirements @miris-inc/voxel51 --install` | Run `pip install -r requirements.txt` in the FiftyOne env. |
+| `fiftyone plugins requirements @miris-inc/voxel51 --ensure`  | Verify the requirements are already satisfied; fail otherwise. |
+
+If you have an NVIDIA GPU, install a CUDA-enabled `torch` **before** running
+`--install` — see https://pytorch.org/get-started/locally/ for the right
+command for your CUDA version. Otherwise `torch` falls back to a CPU build and
+the `dino_sam2` algorithm will be very slow.
+
+> **`visual_hull` only needs numpy + opencv** — if you don't plan to use
+> `dino_sam2`, you can skip the heavy ML deps (torch, transformers, sam2).
+
+### 4. Launch FiftyOne
 
 ```python
 import fiftyone as fo

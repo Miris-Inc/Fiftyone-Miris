@@ -2,11 +2,8 @@
  * Custom Vite config for the Miris FiftyOne plugin.
  *
  * Builds the plugin as a UMD bundle that FiftyOne loads at runtime.
- * Rendering of `MirisStream` fo3d nodes is provided by FiftyOne core; this
- * plugin only ships the sync operator that ingests Miris assets into the
- * current dataset.
- *
- * `@miris-inc/three` is the only Miris SDK bundled here.
+ * `three` MUST be externalized so the plugin operates on the same Object3D
+ * class hierarchy as the host's R3F scene tree.
  */
 
 import { defineConfig } from "vite";
@@ -16,7 +13,9 @@ import react from "@vitejs/plugin-react";
 const FIFTYONE_GLOBALS: Record<string, string> = {
   react: "React",
   "react-dom": "ReactDOM",
+  recoil: "recoil",
   "@fiftyone/operators": "__foo__",
+  "@fiftyone/state": "__fos__",
   three: "__three__",
 };
 

@@ -15,6 +15,9 @@ from fiftyone.core.threed.miris_stream import MirisStream
 from fiftyone.utils.utils3d import OrthographicProjectionMetadata
 
 
+# Path helpers — defined BEFORE the `.python` subpackage imports below, because
+# submodules in that package import these via `from .. import _captures_dir`,
+# which triggers re-entry into this module while it is still loading.
 def _dataset_dir(dataset_name: str) -> str:
     return os.path.join(os.path.expanduser("~"), "fiftyone", dataset_name)
 
@@ -25,6 +28,15 @@ def _thumbnails_dir(dataset_name: str) -> str:
 
 def _scenes_dir(dataset_name: str) -> str:
     return os.path.join(_dataset_dir(dataset_name), "scenes")
+
+
+def _captures_dir(dataset_name: str) -> str:
+    return os.path.join(_dataset_dir(dataset_name), "captures")
+
+
+from .python.save_capture import SaveCaptureBatch
+from .python.save_camera_path_preview import SaveCameraPathPreview
+from .python.segment_miris_stream_frames import SegmentMirisStreamFrames
 
 
 def _cache_thumbnail(uuid: str, url: str, dataset_name: str) -> str | None:
@@ -124,13 +136,6 @@ class UpsertMirisAsset(foo.Operator):
             dataset.info["miris_viewer_key"] = viewer_key
             dataset.save()
 
-        if "bounding_box" not in dataset.get_field_schema():
-            dataset.add_sample_field(
-                "bounding_box",
-                fo.EmbeddedDocumentField,
-                embedded_doc_type=fo.Detections,
-            )
-
         thumbnail_path = _cache_thumbnail(uuid, thumbnail, dataset.name)
         if not thumbnail_path:
             return {"uuid": uuid, "action": "skipped", "reason": "thumbnail download failed"}
@@ -166,3 +171,6 @@ class UpsertMirisAsset(foo.Operator):
 
 def register(p):
     p.register(UpsertMirisAsset)
+    p.register(SaveCaptureBatch)
+    p.register(SaveCameraPathPreview)
+    p.register(SegmentMirisStreamFrames)

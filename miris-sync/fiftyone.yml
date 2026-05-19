@@ -15,3 +15,8 @@ js_bundle: js/dist/index.umd.js
 operators:
   - upsert_miris_asset
   - sync_miris_assets
+  - save_capture_batch
+  - save_camera_path_preview
+  - segment_miris_stream_frames
+  - generate_miris_labels
+  - preview_camera_path

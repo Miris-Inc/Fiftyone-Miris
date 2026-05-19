@@ -16,12 +16,20 @@
   },
   "peerDependencies": {
     "@fiftyone/operators": "*",
+    "@fiftyone/state": "*",
     "react": "^18.0.0",
     "react-dom": "^18.0.0",
+    "recoil": ">=0.7.0",
     "three": "^0.182.0"
   },
   "peerDependenciesMeta": {
     "@fiftyone/operators": {
+      "optional": true
+    },
+    "@fiftyone/state": {
+      "optional": true
+    },
+    "recoil": {
       "optional": true
     }
   },
