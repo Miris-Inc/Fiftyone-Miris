@@ -1,4 +1,4 @@
-# Miris Sync for FiftyOne
+# Miris for FiftyOne
 
 Stream full-fidelity 3D assets inside [FiftyOne](https://voxel51.com) using [Miris Spatial Streaming](https://miris.com). Browse, navigate, and label 3D scenes progressively in the browser — no downloads, no desktop tools.
 
@@ -25,7 +25,7 @@ Sync is idempotent — existing samples are updated in place, and re-running the
 ```
 .
 ├── README.md
-└── miris-sync/          # The FiftyOne plugin
+└── miris/               # The FiftyOne plugin
     ├── fiftyone.yml       # Plugin manifest
     ├── __init__.py        # Python: upsert_miris_asset operator
     ├── README.md          # Installation, usage, and development
@@ -34,7 +34,7 @@ Sync is idempotent — existing samples are updated in place, and re-running the
 
 ## Getting Started
 
-See **[miris-sync/README.md](miris-sync/README.md)** for installation, configuration, and usage.
+See **[miris/README.md](miris/README.md)** for installation, configuration, and usage.
 
 ## License
 

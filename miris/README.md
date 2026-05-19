@@ -1,4 +1,4 @@
-# Miris Sync for FiftyOne
+# Miris for FiftyOne
 
 A FiftyOne plugin that syncs your [Miris](https://miris.com) asset library into a FiftyOne dataset.
 
@@ -27,20 +27,44 @@ git clone <repo-url>
 cd <repo>/fiftyone
 
 PLUGINS_DIR=$(python -c "import fiftyone as fo; print(fo.config.plugins_dir)")
-ln -s "$(pwd)/miris-sync" "$PLUGINS_DIR/miris-sync"
+ln -s "$(pwd)/miris" "$PLUGINS_DIR/miris"
 ```
 
 ### 2. Build the JS bundle
 
 ```bash
-cd miris-sync/js
+cd miris/js
 yarn install
 yarn build
 ```
 
 The build produces `js/dist/index.umd.js` (~14 MB, dominated by the Miris WASM runtime). React, Three.js, and `@fiftyone/*` are externalized against FiftyOne's runtime globals — only `@miris-inc/three` is bundled.
 
-### 3. Launch FiftyOne
+### 3. Install Python dependencies
+
+The plugin ships a `requirements.txt` listing the Python packages needed by its
+operators (numpy, opencv, torch, transformers, sam2, scikit-learn, …). Install
+them into the **same Python env that runs FiftyOne** using FiftyOne's built-in
+helper:
+
+```bash
+fiftyone plugins requirements @miris-inc/voxel51 --install
+```
+
+Variants:
+
+| Command | Purpose |
+|---|---|
+| `fiftyone plugins requirements @miris-inc/voxel51 --print`   | Show the requirements file without touching the env. |
+| `fiftyone plugins requirements @miris-inc/voxel51 --install` | Run `pip install -r requirements.txt` in the FiftyOne env. |
+| `fiftyone plugins requirements @miris-inc/voxel51 --ensure`  | Verify the requirements are already satisfied; fail otherwise. |
+
+If you have an NVIDIA GPU, install a CUDA-enabled `torch` **before** running
+`--install` — see https://pytorch.org/get-started/locally/ for the right
+command for your CUDA version. Otherwise `torch` falls back to a CPU build and
+label generation will be very slow.
+
+### 4. Launch FiftyOne
 
 ```python
 import fiftyone as fo
@@ -61,7 +85,7 @@ Open the FiftyOne app in your browser.
 3. The operator fetches your asset list from Miris and, for each asset, calls the Python `upsert_miris_asset` bridge which:
    - Downloads the thumbnail to `~/fiftyone/<dataset_name>/thumbnails/<uuid>.<ext>`
    - Writes a `.fo3d` scene to `~/fiftyone/<dataset_name>/scenes/<uuid>.fo3d` containing one `MirisStream` node
-   - Stores the viewer key on `dataset.info["miris_viewer_key"]` and adds a `bounding_box` `Detections` field if missing
+   - Stores the viewer key on `dataset.info["miris_viewer_key"]`
    - Creates or updates a sample with `filepath`, `thumbnail_path`, `miris_asset_uuid`, `miris_asset_name`, and `miris_thumbnail_url`
    - Configures the dataset's `app_config` so the grid renders `thumbnail_path`
 
@@ -80,7 +104,7 @@ import fiftyone as fo
 
 dataset = fo.load_dataset("miris-demo")
 sample = dataset.first()
-sample["bounding_box"] = fo.Detections(detections=[
+sample["object_detections"] = fo.Detections(detections=[
     fo.Detection(
         label="robot_arm",
         location=[0, 5, 0],       # center [x, y, z]
@@ -131,7 +155,7 @@ Python  upsert_miris_asset
 ## Plugin Layout
 
 ```
-miris-sync/
+miris/
 ├── fiftyone.yml         # Plugin manifest (name, version, operators, js_bundle)
 ├── __init__.py          # Python: UpsertMirisAsset operator + register()
 ├── README.md            # This file
@@ -152,7 +176,7 @@ miris-sync/
 ### Watch mode
 
 ```bash
-cd miris-sync/js
+cd miris/js
 yarn dev   # vite build --watch
 ```
 

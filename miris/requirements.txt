@@ -1,0 +1,32 @@
+# miris FiftyOne plugin — Python dependencies
+#
+# fiftyone itself is the host; it is not listed here.
+# Install with:  pip install -r requirements.txt
+
+# ── Core (required by both algorithms) ────────────────────────────────────────
+numpy>=1.24
+opencv-python>=4.8
+
+# ── dino_sam2 algorithm ────────────────────────────────────────────────────────
+# Heavy ML stack — only needed when running the dino_sam2 segmentation algorithm.
+
+# PyTorch — the line below installs a CPU-only build by default, which will NOT use your GPU.
+# For GPU support, skip this line and instead run the appropriate command from https://pytorch.org/get-started/locally/
+# (select your OS, Pip, and your CUDA version — check yours with: nvidia-smi)
+# Example for CUDA 13.0:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+torch>=2.5.1
+torchvision>=0.20.1
+
+# Grounding DINO via HuggingFace Transformers
+Pillow>=10.0
+transformers>=4.38
+huggingface_hub>=0.22
+
+# SAM2 (Meta / Facebook Research)
+# PyPI release:
+sam2>=1.0
+# Alternatively, install from source:
+#   pip install git+https://github.com/facebookresearch/sam2.git
+
+# DBSCAN clustering (instance assignment step)
+scikit-learn>=1.3
