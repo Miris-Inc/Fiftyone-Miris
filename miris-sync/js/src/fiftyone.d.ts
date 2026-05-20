@@ -23,6 +23,8 @@ declare module "@fiftyone/operators" {
     params: Record<string, unknown>;
     dataset: { name: string } | null;
     hooks: Record<string, unknown>;
+    /** Queue an operator to run after this execute() returns. */
+    trigger(operatorUri: string, params?: Record<string, unknown>): void;
   }
 
   export function executeOperator(

@@ -1,7 +1,6 @@
 import { Operator, OperatorConfig, ExecutionContext, executeOperator, types } from "@fiftyone/operators";
 import { useRecoilValue } from "recoil";
 import * as fos from "@fiftyone/state";
-import { totalStopsForPath } from "./cameraRig";
 import { runCapture, sanitizeName, buildRunFolder, type CaptureConfig } from "./captureStreamFrames";
 import { setupOffscreenScene } from "./offscreenScene";
 import { DEFAULT_VIEWER_KEY } from "./syncMirisAssets";
@@ -10,9 +9,6 @@ import { readWaypointsFromSample } from "./waypoints";
 
 const PLUGIN_NAME = "@miris-inc/voxel51";
 
-// The pipeline renders offscreen against a static stream, so wall-clock
-// "FPS" is meaningless; this just minimises the leftover sleep in runCapture.
-const CAPTURE_FPS = 60;
 
 export class GenerateMirisLabels extends Operator {
   get config(): OperatorConfig {
@@ -50,7 +46,19 @@ export class GenerateMirisLabels extends Operator {
     });
     inputs.str("path_waypoints", {
       label: "Camera Path Waypoints (JSON)",
-      description: 'Optional sequence of 3D points [[x,y,z],...] defining a camera rig path. Each segment between consecutive waypoints contributes 5 capture stops, and 10 rig cameras fire at each stop (e.g. 3 waypoints → 100 images, 5 waypoints → 200 images). Leave empty to re-use wp* cuboids on the sample, or to use a single default-framed view.',
+      description: 'Optional sequence of 3D points [[x,y,z],...] defining a camera rig path. 10 rig cameras fire at each stop. Leave empty to re-use wp* cuboids on the sample, or to use a single default-framed view.',
+      required: false,
+    });
+    inputs.int("capture_duration", {
+      label: "Capture duration (seconds)",
+      description: "Controls how densely the camera path is sampled together with Capture rate. Ignored when no waypoints are set.",
+      default: 30,
+      required: false,
+    });
+    inputs.int("capture_rate", {
+      label: "Capture rate (fps)",
+      description: "Captures per second of path duration (1–10). Total stops = duration × rate, each firing 10 rig cameras.",
+      default: 2,
       required: false,
     });
     return new types.Property(inputs);
@@ -96,13 +104,14 @@ export class GenerateMirisLabels extends Operator {
       pathWaypoints = readWaypointsFromSample(sample);
     }
 
-    const totalFrames = totalStopsForPath(pathWaypoints);
+    const captureDuration = Math.min(1000, Math.max(1,  ((ctx.params.capture_duration as number | undefined) ?? 30)));
+    const captureRate     = Math.min(10,   Math.max(1,  ((ctx.params.capture_rate     as number | undefined) ?? 2)));
 
     // Fire-and-forget: execute() returns immediately so the modal closes and the
     // user can freely interact with the scene while the pipeline runs.
     runPipeline({
       assetUuid, viewerKey, assetName, datasetName,
-      totalFrames, fps: CAPTURE_FPS, timestamp, algorithm, dinoText, pathWaypoints,
+      captureDuration, fps: captureRate, timestamp, algorithm, dinoText, pathWaypoints,
     }).catch((err: unknown) => {
       console.error("[GenerateMirisLabels]", err);
       executeOperator("@voxel51/operators/notify", {
@@ -120,7 +129,7 @@ interface PipelineArgs {
   viewerKey: string;
   assetName: string;
   datasetName: string;
-  totalFrames: number;
+  captureDuration: number;
   fps: number;
   timestamp: number;
   algorithm: string;
@@ -134,7 +143,8 @@ async function runPipeline(args: PipelineArgs): Promise<void> {
   console.log("[GenerateMirisLabels] starting", {
     assetUuid: args.assetUuid,
     assetName: args.assetName,
-    totalFrames: args.totalFrames,
+    captureDuration: args.captureDuration,
+    fps: args.fps,
     algorithm: args.algorithm,
     hasWaypoints: !!args.pathWaypoints?.length,
     waypointCount: args.pathWaypoints?.length ?? 0,
@@ -155,14 +165,15 @@ async function runPipeline(args: PipelineArgs): Promise<void> {
   try {
     const folderName = buildRunFolder(args.assetName, args.assetUuid, args.timestamp);
 
-    // Phase 1 — capture frames (runCapture emits per-frame progress notifications)
+    // Phase 1 — capture frames (runCapture emits per-frame set_progress updates)
     const captureConfig: CaptureConfig = {
       gl: off.gl,
       camera: off.defaultCamera,
       scene: off.scene,
       stream: off.stream,
-      totalFrames: args.totalFrames,
+      captureDuration: args.captureDuration,
       fps: args.fps,
+      preCaptureDelayMs: 1000,
       assetUuid: args.assetUuid,
       assetName: args.assetName,
       timestamp: args.timestamp,

@@ -38,12 +38,20 @@ class SaveCaptureBatch(foo.Operator):
         import json as jsonlib
 
         png_items = ctx.params.get("png_items") or []
+        npy_items = ctx.params.get("npy_items") or []
         json_items = ctx.params.get("json_items") or []
         errors: list[str] = []
         saved = 0
 
         for item in png_items:
             r = _save_artifact(ctx, item["filename"], base64.b64decode(item["png_base64"]))
+            if r["status"] == "ok":
+                saved += 1
+            else:
+                errors.append(r["error"])
+
+        for item in npy_items:
+            r = _save_artifact(ctx, item["filename"], base64.b64decode(item["data_base64"]))
             if r["status"] == "ok":
                 saved += 1
             else:

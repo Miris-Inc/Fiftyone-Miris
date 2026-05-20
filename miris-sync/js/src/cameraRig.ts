@@ -19,31 +19,6 @@ export const RIG_CAMERAS: RigCamera[] = [
 ];
 
 /**
- * How many capture stops to plant per polyline segment.
- *
- * Total stops along a path of N waypoints = (N - 1) * STOPS_PER_SEGMENT.
- * Stops are distributed uniformly by arc length across the full polyline
- * (longer segments naturally get proportionally more stops). Each stop fires
- * the full {@link RIG_CAMERAS} rig, so total images per run is
- *   (N - 1) * STOPS_PER_SEGMENT * RIG_CAMERAS.length.
- *
- * Adjust here and rebuild the JS bundle to change rig density without
- * touching the operators.
- */
-export const STOPS_PER_SEGMENT = 5;
-
-/**
- * Number of capture stops along a polyline of `waypoints`.
- * Returns 1 for 0/1 waypoints (degenerate single-camera fallback).
- */
-export function totalStopsForPath(
-  waypoints: [number, number, number][] | undefined,
-): number {
-  if (!waypoints || waypoints.length < 2) return 1;
-  return (waypoints.length - 1) * STOPS_PER_SEGMENT;
-}
-
-/**
  * Returns the position along `waypoints` at normalized time `t ∈ [0, 1]`
  * using arc-length (constant-speed) parameterization.
  */
