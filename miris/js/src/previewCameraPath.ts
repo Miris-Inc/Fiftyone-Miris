@@ -1,7 +1,7 @@
 import { Operator, OperatorConfig, ExecutionContext, executeOperator, types } from "@fiftyone/operators";
 import { useRecoilValue } from "recoil";
 import * as fos from "@fiftyone/state";
-import { RIG_CAMERAS, interpolatePath, totalStopsForPath } from "./cameraRig";
+import { RIG_CAMERAS, interpolatePath } from "./cameraRig";
 import { setupOffscreenScene } from "./offscreenScene";
 import { DEFAULT_VIEWER_KEY } from "./syncMirisAssets";
 import { executeOperatorAndReturn } from "./utils";
@@ -86,7 +86,7 @@ export class PreviewCameraPath extends Operator {
       assetUuid,
       viewerKey,
       waypoints,
-      totalFrames: totalStopsForPath(waypoints),
+      totalFrames: Math.max(1, (waypoints.length - 1) * 5),
     }).catch((err: unknown) => {
       console.error("[PreviewCameraPath]", err);
       executeOperator("@voxel51/operators/notify", {

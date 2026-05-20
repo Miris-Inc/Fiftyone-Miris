@@ -1,69 +1,20 @@
 import { executeOperator } from "@fiftyone/operators";
-import { Camera, PerspectiveCamera, Scene, WebGLRenderer, WebGLRenderTarget } from "three";
+import {
+  Box3, Camera, Frustum, Matrix4, PerspectiveCamera, Scene, Vector3,
+  WebGLRenderer, WebGLRenderTarget, FloatType, RedFormat,
+} from "three";
 import { RIG_CAMERAS, createRigCamera, interpolatePath } from "./cameraRig";
 import { executeOperatorAndReturn } from "./utils";
 
 const PLUGIN_NAME = "@miris-inc/voxel51";
 const SAVE_BATCH_OP = `${PLUGIN_NAME}/save_capture_batch`;
 
-// After moving to a new camera, the splat renderer needs time to re-sort
-// splats by depth and to stream in chunks that just came into view. If we
-// capture immediately, frames can show splats in the wrong z-order or with
-// missing chunks. We settle for SETTLE_MS total per camera, calling
-// gl.render() at SETTLE_INTERMEDIATE_RENDERS evenly-spaced intervals so the
-// renderer keeps ticking and progressively refines.
-//
-// Cost: ~SETTLE_MS per camera. With the default 10-rig × 5-stop-per-segment
-// path and 3 waypoints that's 100 cameras × 1s ≈ 100s extra per run. Tune
-// down (e.g. 250ms) if your scene is small/static; tune up if you still see
-// sort artifacts.
-const SETTLE_MS = 1000;
-const SETTLE_INTERMEDIATE_RENDERS = 4;
-
-// Wait after switching the stream into "SplatDepthColor" mode before the
-// first depth readback — the splat shader recompile + async chunk streaming
-// would otherwise bleed depth pixels into colour frames. If artifacts return,
-// raise this before adding intermediate render ticks.
-const DEPTH_SETTLE_MS = 1000;
-// Per-camera settle inside the depth pass. Chunks are already loaded from the
-// preceding colour pass; only the splat sort needs to converge for the new
-// camera angle, so this is much shorter than SETTLE_MS.
-const DEPTH_PER_CAMERA_MS = 150;
-
-const DEPTH_MODE = "SplatDepthColor";
-const SPLAT_MODE = "Splats";
-
-// Factors mirror the SDK's internal _setDepthLimits.
-const DEPTH_NEAR_FACTOR = 0.1;
-const DEPTH_FAR_FACTOR = 10;
-const DEPTH_ENCODING = "single_r";
-
-interface MirisStream {
-  getBounds(): { size: number[] };
-  _setRenderMode(mode: string): void;
-}
-
-function streamControls(stream: unknown) {
-  const s = stream as MirisStream;
-  return {
-    getBounds: () => s.getBounds(),
-    async withDepthMode<T>(fn: () => Promise<T>): Promise<T> {
-      s._setRenderMode(DEPTH_MODE);
-      try {
-        return await fn();
-      } finally {
-        s._setRenderMode(SPLAT_MODE);
-      }
-    },
-  };
-}
-
 export interface FrameData {
   frame: number;
   camera_name?: string;
   color_filename: string;
-  camera_json_filename: string;
   depth_filename: string;
+  camera_json_filename: string;
 }
 
 export interface CaptureConfig {
@@ -72,8 +23,9 @@ export interface CaptureConfig {
   scene: Scene;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   stream: any;
-  totalFrames: number;
+  captureDuration: number;
   fps: number;
+  preCaptureDelayMs: number;
   assetUuid: string;
   assetName: string;
   timestamp: number;
@@ -92,189 +44,277 @@ export function buildRunFolder(name: string, uuid: string, timestamp: number): s
 // ── capture loop ─────────────────────────────────────────────────────────────
 
 export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
-  const { gl, camera, scene, stream, totalFrames, fps, assetUuid, assetName, timestamp, folderName, pathWaypoints } = cfg;
-  const intervalMs = 1000 / fps;
+  const { gl, camera, scene, stream, captureDuration, fps, preCaptureDelayMs, assetUuid, assetName, timestamp, folderName, pathWaypoints } = cfg;
+  const intervalMs        = 1000 / fps;
+  const captureDurationMs = captureDuration * 1000;
+
   const glCtx = gl.getContext();
   const w = glCtx.drawingBufferWidth;
   const h = glCtx.drawingBufferHeight;
 
-  const target = new WebGLRenderTarget(w, h, { depthBuffer: true, stencilBuffer: false });
-  const encCanvas = document.createElement("canvas");
-  encCanvas.width = w;
-  encCanvas.height = h;
+  const target      = new WebGLRenderTarget(w, h, { depthBuffer: false, stencilBuffer: false });
+  const targetDepth = new WebGLRenderTarget(w, h, { type: FloatType, format: RedFormat });
+  const encCanvas   = document.createElement("canvas");
+  encCanvas.width   = w;
+  encCanvas.height  = h;
   const enc2d = encCanvas.getContext("2d")!;
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const bounds = (stream as any).getBounds() as { size: number[]; center: number[] } | null;
+  const streamCenter = bounds
+    ? new Vector3(bounds.center[0] ?? 0, bounds.center[1] ?? 0, bounds.center[2] ?? 0)
+    : new Vector3();
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const modelRoot = (stream as any).children[0];
+  const prevMode: string = modelRoot?._renderMode ?? "Splats";
+
   const frameDataList: FrameData[] = [];
+  const capturePositions: Vector3[] = [];
+  const hasPath = !!(pathWaypoints && pathWaypoints.length > 0);
   let skippedEmpty = 0;
 
-  const useRig = pathWaypoints && pathWaypoints.length > 0;
+  // Seed stream refinement at the starting position, then hold still for the
+  // pre-capture delay so the stream can refine before the camera starts moving.
+  if (hasPath) {
+    const [sx = 0, sy = 0, sz = 0] = pathWaypoints![0];
+    camera.position.set(sx, sy, sz);
+  }
+  camera.lookAt(streamCenter);
+  camera.updateMatrixWorld(true);
+  gl.render(scene, camera);
+
+  if (preCaptureDelayMs > 0) await sleep(preCaptureDelayMs);
+
+  // ── rAF loop ──────────────────────────────────────────────────────────────
+  // Moves the offscreen camera continuously along the path for the full capture
+  // duration, starting only after the pre-capture delay. This drives MirisStream
+  // progressive refinement between captures.
+  let rafHandle = -1;
+  let rafStartTime: number | null = null;
+
+  if (hasPath) {
+    const tick = (now: number) => {
+      if (rafStartTime === null) rafStartTime = now;
+      const t   = Math.min(1, (now - rafStartTime) / captureDurationMs);
+      const pos = interpolatePath(pathWaypoints!, t);
+      camera.position.copy(pos);
+      camera.lookAt(streamCenter);
+      camera.updateMatrixWorld(true);
+      gl.render(scene, camera);
+      if (t < 1) rafHandle = requestAnimationFrame(tick);
+    };
+    rafHandle = requestAnimationFrame(tick);
+  }
+
+  // ── capture loop ──────────────────────────────────────────────────────────
+  // Best-effort capture at `fps` Hz for `captureDuration` seconds.
+  // Uses wall-clock slot scheduling: after each capture, skip forward to the
+  // next future slot so that slow renders don't cause the run to exceed the
+  // requested duration — they simply reduce the number of captures taken.
+  const camLabel     = `, ${RIG_CAMERAS.length} cameras`;
+  const captureStart = performance.now();
+  let captureCount   = 0;
+  let slotIndex      = 0;
 
   try {
-    for (let frame = 0; frame < totalFrames; frame++) {
-      if (frame > 0) await sleep(intervalMs);
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      // Wait until the next scheduled slot (or fire immediately if already past).
+      const slotTime = captureStart + slotIndex * intervalMs;
+      const waitMs   = slotTime - performance.now();
+      if (waitMs > 0) await sleep(waitMs);
 
-      // Determine which cameras to render this time step
-      type RenderEntry = { camName: string | undefined; renderCam: Camera };
-      let entries: RenderEntry[];
+      // Stop if the capture window has closed.
+      const elapsed = performance.now() - captureStart;
+      if (elapsed >= captureDurationMs) break;
 
-      if (useRig) {
-        const t = totalFrames <= 1 ? 0 : frame / (totalFrames - 1);
-        const position = interpolatePath(pathWaypoints!, t);
-        entries = RIG_CAMERAS.map(rig => ({
-          camName: rig.name,
-          renderCam: createRigCamera(position, rig.direction, camera),
-        }));
-      } else {
-        entries = [{ camName: undefined, renderCam: camera }];
-      }
+      const position = camera.position.clone();
+      const entries = RIG_CAMERAS.map(rig => ({
+        camName:   rig.name,
+        renderCam: createRigCamera(position, rig.direction, camera),
+      }));
 
-      const pngItems: { filename: string; png_base64: string }[] = [];
-      const jsonItems: { filename: string; json_str: string }[] = [];
-      const stepFrameData: FrameData[] = [];
+      const visibleEntries = entries.filter(({ renderCam }) =>
+        isCameraVisible(renderCam as PerspectiveCamera, bounds),
+      );
 
-      const frameStr = String(frame).padStart(4, "0");
-      const prevTarget = gl.getRenderTarget();
+      if (visibleEntries.length > 0) {
+        const frameStr   = String(captureCount + 1).padStart(4, "0");
+        const prevTarget = gl.getRenderTarget();
 
-      // Depth limits are stashed on each camera JSON so the Python decoder
-      // can reverse the encoding.
-      const ctrl = streamControls(stream);
-      const bounds = ctrl.getBounds();
-      const bound = Math.max(...(bounds?.size ?? [0]));
-      const depthMin = Math.max(0.01, bound * DEPTH_NEAR_FACTOR);
-      const depthMax = Math.max(depthMin + 1e-3, bound * DEPTH_FAR_FACTOR);
+        const pngItems:  { filename: string; png_base64:  string }[] = [];
+        const npyItems:  { filename: string; data_base64: string }[] = [];
+        const jsonItems: { filename: string; json_str:    string }[] = [];
+        const stepFrameData: FrameData[] = [];
 
-      // PNGs are encoded inline so we don't hold a Uint8Array per camera
-      // alive across the depth pass; the readback buffer is reused.
-      type CapturedEntry = {
-        camName: string | undefined;
-        renderCam: Camera;
-        colorPng: string;
-      };
-      const captured: CapturedEntry[] = [];
-      const readback = new Uint8Array(w * h * 4);
+        // Pass 1 — color: render each visible camera and isEmpty-filter.
+        // Collect survivors into `captured` for the depth pass.
+        type CapturedEntry = { camName: string | undefined; renderCam: PerspectiveCamera; colorPng: string };
+        const captured: CapturedEntry[] = [];
 
-      for (const { camName, renderCam } of entries) {
-        // Settle: kick the splat depth sort + async chunk streaming with one
-        // render, then keep the renderer ticking with intermediate render()
-        // calls over SETTLE_MS so the sort converges before readback.
-        renderToTarget(gl, target, scene, renderCam);
-        const sliceMs = SETTLE_MS / (SETTLE_INTERMEDIATE_RENDERS + 1);
-        for (let s = 0; s < SETTLE_INTERMEDIATE_RENDERS; s++) {
-          await sleep(sliceMs);
+        for (const { camName, renderCam } of visibleEntries) {
+          gl.setRenderTarget(target);
+          gl.setClearColor(0x000000, 0);
+          gl.clear(true, true, false);
           gl.render(scene, renderCam);
-        }
-        await sleep(sliceMs);
+          const rgba = new Uint8Array(w * h * 4);
+          gl.readRenderTargetPixels(target, 0, 0, w, h, rgba);
 
-        renderToTarget(gl, target, scene, renderCam);
-        gl.readRenderTargetPixels(target, 0, 0, w, h, readback);
+          // Discard frames where no splat covered any pixel (frustum false-positive).
+          if (isEmpty(rgba)) { skippedEmpty++; continue; }
 
-        // Rig cameras that pointed into the void show zero alpha everywhere;
-        // saving + segmenting them is pure waste.
-        if (isEmpty(readback)) {
-          skippedEmpty++;
-          continue;
+          captured.push({ camName, renderCam: renderCam as PerspectiveCamera, colorPng: encodePng(enc2d, encCanvas, rgba, w, h) });
         }
 
-        captured.push({ camName, renderCam, colorPng: encodePng(enc2d, encCanvas, readback, w, h) });
-      }
-
-      // Switch into depth mode ONCE for the whole frame. Per-camera toggling
-      // crashed the browser (Aw Snap / GPU process fault): each
-      // `_setRenderMode` walks every splat child and rewrites its material
-      // (@miris-inc/three/three.js:27568, setDepthColor at :26926), so
-      // hundreds of toggles exhaust GPU resources. One toggle pair per frame
-      // is the safe envelope.
-      const depthPngs: string[] = new Array(captured.length);
-      if (captured.length > 0) {
-        await ctrl.withDepthMode(async () => {
-          await sleep(DEPTH_SETTLE_MS);
-          for (let ci = 0; ci < captured.length; ci++) {
-            const { renderCam } = captured[ci];
-            renderToTarget(gl, target, scene, renderCam);
-            await sleep(DEPTH_PER_CAMERA_MS);
-            gl.render(scene, renderCam);
-
-            gl.readRenderTargetPixels(target, 0, 0, w, h, readback);
-            depthPngs[ci] = encodePng(enc2d, encCanvas, readback, w, h);
+        // Pass 2 — depth: switch render mode ONCE for the whole frame.
+        // Per-camera _setRenderMode toggles walk every splat child and rewrite
+        // its material, exhausting GPU resources with many cameras per frame.
+        const depthData: Float32Array[] = new Array(captured.length);
+        if (captured.length > 0) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (stream as any)._setRenderMode("SplatDepthColor");
+          try {
+            for (let ci = 0; ci < captured.length; ci++) {
+              const { renderCam } = captured[ci];
+              gl.setRenderTarget(targetDepth);
+              gl.clear(true, true, false);
+              gl.render(scene, renderCam);
+              const df = new Float32Array(w * h);
+              gl.readRenderTargetPixels(targetDepth, 0, 0, w, h, df);
+              depthData[ci] = df;
+            }
+          } finally {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (stream as any)._setRenderMode(prevMode);
           }
-        });
-      }
+        }
 
-      for (let ci = 0; ci < captured.length; ci++) {
-        const { camName, renderCam, colorPng } = captured[ci];
-        const depthPng = depthPngs[ci];
-        const colorFilename   = buildFilename(assetName, assetUuid, timestamp, "color",  frameStr, "png",  camName);
-        const camJsonFilename = buildFilename(assetName, assetUuid, timestamp, "camera", frameStr, "json", camName);
-        const depthFilename   = buildFilename(assetName, assetUuid, timestamp, "depth",  frameStr, "png",  camName);
+        // Build batch items from the captured color + depth pairs.
+        for (let ci = 0; ci < captured.length; ci++) {
+          const { camName, renderCam, colorPng } = captured[ci];
+          const depthFloat = depthData[ci];
 
-        pngItems.push({ filename: `${folderName}/${colorFilename}`, png_base64: colorPng });
-        pngItems.push({ filename: `${folderName}/${depthFilename}`, png_base64: depthPng });
-        jsonItems.push({
-          filename: `${folderName}/${camJsonFilename}`,
-          json_str: JSON.stringify(buildCameraJson(
-            renderCam, w, h, assetName, assetUuid, timestamp, frameStr, camName,
-            { depth_filename: depthFilename, depth_min: depthMin, depth_max: depthMax, depth_encoding: DEPTH_ENCODING },
-          )),
-        });
+          const colorFilename   = buildFilename(assetName, assetUuid, timestamp, "color",  frameStr, "png",  camName);
+          const depthFilename   = buildFilename(assetName, assetUuid, timestamp, "depth",  frameStr, "npy",  camName);
+          const camJsonFilename = buildFilename(assetName, assetUuid, timestamp, "camera", frameStr, "json", camName);
 
-        stepFrameData.push({
-          frame,
-          ...(camName !== undefined ? { camera_name: camName } : {}),
-          color_filename:       `${folderName}/${colorFilename}`,
-          camera_json_filename: `${folderName}/${camJsonFilename}`,
-          depth_filename:       `${folderName}/${depthFilename}`,
-        });
-      }
+          pngItems.push ({ filename: `${folderName}/${colorFilename}`,   png_base64:  colorPng });
+          npyItems.push ({ filename: `${folderName}/${depthFilename}`,   data_base64: encodeNpy(depthFloat, w, h) });
+          jsonItems.push({ filename: `${folderName}/${camJsonFilename}`, json_str:    JSON.stringify(buildCameraJson(renderCam, w, h, assetName, assetUuid, timestamp, frameStr, camName)) });
 
-      gl.setRenderTarget(prevTarget);
-
-      if (pngItems.length > 0) {
-        const batchResult = await executeOperatorAndReturn(SAVE_BATCH_OP, { png_items: pngItems, json_items: jsonItems });
-        if (batchResult.status === "error") {
-          await executeOperator("@voxel51/operators/notify", {
-            message: `Frame ${frame}: batch save failed — ${batchResult.error as string}`,
-            variant: "warning",
+          stepFrameData.push({
+            frame: captureCount,
+            ...(camName !== undefined ? { camera_name: camName } : {}),
+            color_filename:       `${folderName}/${colorFilename}`,
+            depth_filename:       `${folderName}/${depthFilename}`,
+            camera_json_filename: `${folderName}/${camJsonFilename}`,
           });
         }
+
+        gl.setRenderTarget(prevTarget);
+
+        if (pngItems.length > 0) {
+          const batchResult = await executeOperatorAndReturn(SAVE_BATCH_OP, { png_items: pngItems, npy_items: npyItems, json_items: jsonItems });
+          if (batchResult.status === "error") {
+            await executeOperator("@voxel51/operators/notify", {
+              message: `Frame ${frameStr}: batch save failed — ${batchResult.error as string}`,
+              variant: "warning",
+            });
+          }
+        }
+
+        if (stepFrameData.length > 0) {
+          capturePositions.push(camera.position.clone());
+          frameDataList.push(...stepFrameData);
+          captureCount++;
+        }
       }
 
-      frameDataList.push(...stepFrameData);
+      // Advance to the next future slot, skipping any that the render consumed.
+      const elapsedAfter = performance.now() - captureStart;
+      const nextSlot     = Math.ceil(elapsedAfter / intervalMs);
+      slotIndex          = Math.max(slotIndex + 1, nextSlot);
 
-      const pct = Math.round((frame + 1) / totalFrames * 100);
-      const camLabel = useRig ? `, ${RIG_CAMERAS.length} cameras` : "";
-      await executeOperator("@voxel51/operators/notify", {
-        message: `Generating labels from Miris stream...capturing frames${camLabel}...${pct}%`,
-        variant: "info",
+      await executeOperator("@voxel51/operators/set_progress", {
+        progress: Math.min(1, elapsedAfter / captureDurationMs),
+        label: `Capturing frames${camLabel}…`,
+      });
+    }
+
+    // Save actual capture positions and the interpolated path for comparison in
+    // the FiftyOne 3D viewer.
+    if (hasPath && capturePositions.length > 0) {
+      const maxDim = Math.max(...(bounds?.size ?? [1, 1, 1]), 1);
+      const wpSize  = Math.max(maxDim * 0.01, 0.05);
+      const rigSize = wpSize * 0.5;
+
+      const waypointDets = pathWaypoints!.map((wp, i) => ({
+        label:      `wp${i}`,
+        location:   [wp[0], wp[1], wp[2]],
+        dimensions: [wpSize, wpSize, wpSize],
+        rotation:   [0, 0, 0],
+      }));
+
+      const rigDets = capturePositions.map((pos, i) => ({
+        label:      `cap_${String(i + 1).padStart(4, "0")}`,
+        location:   [pos.x, pos.y, pos.z],
+        dimensions: [rigSize, rigSize, rigSize],
+        rotation:   [0, 0, 0],
+      }));
+
+      const polyline = pathWaypoints!.map(wp => [wp[0], wp[1], wp[2]]);
+
+      await executeOperatorAndReturn(`${PLUGIN_NAME}/save_camera_path_preview`, {
+        asset_uuid: assetUuid,
+        waypoints:  waypointDets,
+        rig:        rigDets,
+        polyline,
       });
     }
   } finally {
+    cancelAnimationFrame(rafHandle);
     target.dispose();
+    targetDepth.dispose();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (stream as any)._setRenderMode?.(prevMode);
   }
 
   if (skippedEmpty > 0) {
-    console.log(`[runCapture] skipped ${skippedEmpty} empty frame(s); kept ${frameDataList.length}`);
+    console.log(`[runCapture] skipped ${skippedEmpty} empty frame(s) (frustum false-positives); kept ${frameDataList.length}`);
   }
 
   return frameDataList;
 }
 
-function isEmpty(rgba: Uint8Array): boolean {
-  // View as uint32s and mask off the alpha byte (high byte in LE). 4× fewer
-  // iterations than walking bytes.
-  const u32 = new Uint32Array(rgba.buffer, rgba.byteOffset, rgba.length >>> 2);
-  for (let i = 0; i < u32.length; i++) {
-    if ((u32[i] & 0xff000000) !== 0) return false;
-  }
-  return true;
-}
-
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-function renderToTarget(gl: WebGLRenderer, target: WebGLRenderTarget, scene: Scene, cam: Camera): void {
-  gl.setRenderTarget(target);
-  gl.setClearColor(0x000000, 0);
-  gl.clear(true, true, false);
-  gl.render(scene, cam);
+function isCameraVisible(
+  cam: PerspectiveCamera,
+  bounds: { size: number[]; center: number[] } | null,
+): boolean {
+  if (!bounds) return true;
+  const frustum = new Frustum();
+  frustum.setFromProjectionMatrix(
+    new Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse),
+  );
+  const [cx = 0, cy = 0, cz = 0] = bounds.center;
+  const [sx = 0, sy = 0, sz = 0] = bounds.size;
+  const box = new Box3(
+    new Vector3(cx - sx / 2, cy - sy / 2, cz - sz / 2),
+    new Vector3(cx + sx / 2, cy + sy / 2, cz + sz / 2),
+  );
+  return frustum.intersectsBox(box);
+}
+
+function isEmpty(rgba: Uint8Array): boolean {
+  // View as uint32s and mask off the alpha byte (high byte in LE) — 4× fewer
+  // iterations than checking every 4th byte.
+  const u32 = new Uint32Array(rgba.buffer, rgba.byteOffset, rgba.length >>> 2);
+  for (let i = 0; i < u32.length; i++) {
+    if ((u32[i]! & 0xff000000) !== 0) return false;
+  }
+  return true;
 }
 
 function buildFilename(
@@ -290,15 +330,8 @@ function buildFilename(
   return `${name}_${uuid}_${timestamp}_${frame}${camPart}_${channel}.${ext}`;
 }
 
-interface DepthMeta {
-  depth_filename: string;
-  depth_min: number;
-  depth_max: number;
-  depth_encoding: string;
-}
-
 function buildCameraJson(
-  camera: Camera,
+  cam: PerspectiveCamera,
   w: number,
   h: number,
   assetName: string,
@@ -306,9 +339,7 @@ function buildCameraJson(
   timestamp: number,
   frameStr: string,
   camName?: string,
-  depthMeta?: DepthMeta,
 ): object {
-  const cam = camera as PerspectiveCamera;
   const fovRad = (cam.fov ?? 50) * (Math.PI / 180);
   const fy = h / 2 / Math.tan(fovRad / 2);
   const fx = fy; // square pixels — Three.js vFOV drives both axes uniformly
@@ -332,15 +363,39 @@ function buildCameraJson(
     camera_intrinsics: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
     world_to_camera: worldToCamera,
     image_path: buildFilename(assetName, assetUuid, timestamp, "color", frameStr, "png", camName),
-    depth_range: [cam.near ?? 0.1, cam.far ?? 2000],
     horizontal_aperture: null,
     source_coordinate_system: null,
     meters_per_unit: 1.0,
     frame: parseInt(frameStr, 10),
     clip_near: cam.near ?? 0.1,
     clip_far: cam.far ?? 2000,
-    ...(depthMeta ?? {}),
   };
+}
+
+function encodeNpy(data: Float32Array, w: number, h: number): string {
+  const flipped   = flipVerticalFloat32(data, w, h);
+  const header    = `{'descr': '<f4', 'fortran_order': False, 'shape': (${h}, ${w}), }`;
+  const unpaddedTotal = 10 + header.length + 1;
+  const paddedTotal   = Math.ceil(unpaddedTotal / 64) * 64;
+  const headerPadded  = header.padEnd(header.length + (paddedTotal - unpaddedTotal), " ") + "\n";
+  const headerBytes   = new TextEncoder().encode(headerPadded);
+  const out  = new Uint8Array(10 + headerBytes.length + flipped.byteLength);
+  const view = new DataView(out.buffer);
+  out.set([0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59, 0x01, 0x00]);
+  view.setUint16(8, headerBytes.length, true);
+  out.set(headerBytes, 10);
+  out.set(new Uint8Array(flipped.buffer), 10 + headerBytes.length);
+  let binary = "";
+  for (let i = 0; i < out.length; i++) binary += String.fromCharCode(out[i]!);
+  return btoa(binary);
+}
+
+function flipVerticalFloat32(data: Float32Array, w: number, h: number): Float32Array {
+  const flipped = new Float32Array(data.length);
+  for (let y = 0; y < h; y++) {
+    flipped.set(data.subarray(y * w, (y + 1) * w), (h - 1 - y) * w);
+  }
+  return flipped;
 }
 
 function encodePng(
@@ -355,7 +410,7 @@ function encodePng(
 }
 
 function flipVertical(pixels: Uint8Array, w: number, h: number): Uint8Array {
-  const flipped = new Uint8Array(pixels.length);
+  const flipped  = new Uint8Array(pixels.length);
   const rowBytes = w * 4;
   for (let y = 0; y < h; y++) {
     flipped.set(pixels.subarray(y * rowBytes, (y + 1) * rowBytes), (h - 1 - y) * rowBytes);
