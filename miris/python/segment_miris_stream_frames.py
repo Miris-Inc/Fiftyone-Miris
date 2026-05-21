@@ -105,6 +105,14 @@ class SegmentMirisStreamFrames(foo.Operator):
                 f"nothing to save. Usually means DINO/SAM2 found nothing "
                 f"matching the text prompt."
             )
+            yield ctx.trigger("@voxel51/operators/notify", params={
+                "message": (
+                    f'No detections found for "{asset_name}". '
+                    f"DINO found no objects matching the text prompt, or the depth cloud "
+                    f"could not be built (check the console for details)."
+                ),
+                "variant": "warning",
+            })
             return
 
         yield ctx.log(

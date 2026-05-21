@@ -369,6 +369,8 @@ function buildCameraJson(
     frame: parseInt(frameStr, 10),
     clip_near: cam.near ?? 0.1,
     clip_far: cam.far ?? 2000,
+    depth_min: cam.near ?? 0.1,
+    depth_max: cam.far ?? 2000,
   };
 }
 

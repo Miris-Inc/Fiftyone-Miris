@@ -31,35 +31,38 @@ def load_depth_map(
     *,
     dither: bool = True,
 ) -> np.ndarray:
-    """Load a depth PNG and decode to float32 (H, W) in meters.
+    """Load a depth map and decode to float32 (H, W) in meters.
 
-    ``dither`` adds ±½-band uniform jitter per pixel. With only 256 grayscale
-    levels through a log curve, on a 1 m scene each byte step is ~18 mm —
-    coarser than our 5 mm voxel, which would paint concentric shell bands on
-    continuous surfaces. Jitter smears each pixel inside its band so bands
-    overlap in world space; the mean is unchanged so surface position is preserved.
+    Accepts either a PNG (8-bit log-encoded, R==G==B) or a ``.npy`` file
+    (float32 single-channel, same log encoding but without 8-bit quantisation).
+
+    ``dither`` adds ±½-band uniform jitter per pixel for PNG inputs only —
+    it smears the coarse 8-bit quantisation steps so they overlap in world
+    space without biasing the mean. ``.npy`` inputs carry full float32
+    precision and do not need dithering.
     """
-    bgra = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if bgra is None:
-        raise IOError(f"Cannot read depth PNG: {path}")
-    if bgra.ndim == 2:
-        bgra = cv2.cvtColor(bgra, cv2.COLOR_GRAY2BGRA)
-    elif bgra.shape[2] == 3:
-        bgra = cv2.cvtColor(bgra, cv2.COLOR_BGR2BGRA)
+    if path.suffix == ".npy":
+        # Float32 single-channel: same log encoding as the PNG, but stored as
+        # a continuous float — skip the /255 quantisation step, no dithering.
+        norm = np.load(str(path)).astype(np.float32)
+    else:
+        bgra = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if bgra is None:
+            raise IOError(f"Cannot read depth PNG: {path}")
+        if bgra.ndim == 2:
+            bgra = cv2.cvtColor(bgra, cv2.COLOR_GRAY2BGRA)
+        elif bgra.shape[2] == 3:
+            bgra = cv2.cvtColor(bgra, cv2.COLOR_BGR2BGRA)
+        # cv2 returns BGRA. The SDK writes R==G==B so any channel works; use red.
+        norm = bgra[..., 2].astype(np.float32) / 255.0
 
-    # cv2 returns BGRA. The SDK writes R==G==B so any channel works; use red.
-    norm = bgra[..., 2].astype(np.float32) / 255.0
-    log_depth = 1.0 - norm
-    L_min = np.log2(depth_min + 1.0).astype(np.float32)
-    L_max = np.log2(depth_max + 1.0).astype(np.float32)
-    L = log_depth * (L_max - L_min) + L_min
-    depth = (np.exp2(L) - 1.0).astype(np.float32)
+    L_min = float(np.log2(depth_min + 1.0))
+    L_max = float(np.log2(depth_max + 1.0))
+    depth = (np.exp2((1.0 - norm) * (L_max - L_min) + L_min) - 1.0).astype(np.float32)
 
-    if dither:
+    if dither and path.suffix != ".npy":
         # Per-byte log step (in log2-space) over [depth_min, depth_max].
-        log_step = (
-            float(np.log2(depth_max + 1.0) - np.log2(depth_min + 1.0)) / 255.0
-        )
+        log_step = (L_max - L_min) / 255.0
         # Local band width at each pixel: dz/dL = ln(2) * (z + 1).
         band = (np.log(2.0) * (depth + 1.0) * log_step).astype(np.float32)
         rng = np.random.default_rng()
@@ -227,12 +230,12 @@ def build_depth_cloud(
             continue
 
         meta = _load_camera(frame["camera"])
-        dmin = float(meta.get("depth_min", 0.01))
-        dmax = float(meta.get("depth_max", 1000.0))
 
         try:
-            depth = load_depth_map(depth_path, dmin, dmax)
-        except IOError as exc:
+            dmin = float(meta.get("depth_min", 0.01))
+            dmax = float(meta.get("depth_max", 1000.0))
+            depth = load_depth_map(pathlib.Path(depth_path), dmin, dmax)
+        except (IOError, Exception) as exc:
             print(f"[depth] frame {i}: {exc}")
             n_skipped += 1
             continue

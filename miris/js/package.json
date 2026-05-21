@@ -12,7 +12,7 @@
     "build": "vite build"
   },
   "dependencies": {
-    "@miris-inc/three": "latest"
+    "@miris-inc/three": "file:/C:/Users/DanielVijayakumar/Development/miris/aqua/modules/web_projects/packages/three"
   },
   "peerDependencies": {
     "@fiftyone/operators": "*",
