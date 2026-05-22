@@ -1,13 +1,33 @@
 import { executeOperator } from "@fiftyone/operators";
 import {
   Box3, Camera, Frustum, Matrix4, PerspectiveCamera, Scene, Vector3,
-  WebGLRenderer, WebGLRenderTarget, FloatType, RedFormat,
+  WebGLRenderer, WebGLRenderTarget,
 } from "three";
 import { RIG_CAMERAS, createRigCamera, interpolatePath } from "./cameraRig";
 import { executeOperatorAndReturn } from "./utils";
 
 const PLUGIN_NAME = "@miris-inc/voxel51";
 const SAVE_BATCH_OP = `${PLUGIN_NAME}/save_capture_batch`;
+
+// Factors mirror the SDK's internal _setDepthLimits.
+const DEPTH_NEAR_FACTOR = 0.1;
+const DEPTH_FAR_FACTOR = 10;
+const DEPTH_ENCODING = "single_r";
+
+/**
+ * rig            — Waypoints + 10-camera rig. Scene camera gazes at the first
+ *                  POI (or bounds center if no POIs) for octree refinement only;
+ *                  rig cameras handle capture.
+ * nearest_poi    — Waypoints + POIs. Single camera for both capture and
+ *                  refinement; gazes at the spatially closest POI each slot.
+ * coverage_greedy— Waypoints + POIs. Single camera; gazes at the POI with the
+ *                  least angular-coverage accumulated so far.
+ */
+export enum CaptureMode {
+  Rig           = "rig",
+  NearestPoi    = "nearest_poi",
+  CoverageGreedy = "coverage_greedy",
+}
 
 export interface FrameData {
   frame: number;
@@ -31,6 +51,8 @@ export interface CaptureConfig {
   timestamp: number;
   folderName: string;
   pathWaypoints?: [number, number, number][];
+  captureMode?: CaptureMode;
+  pointsOfInterest?: [number, number, number][];
 }
 
 export function sanitizeName(name: string): string {
@@ -41,10 +63,65 @@ export function buildRunFolder(name: string, uuid: string, timestamp: number): s
   return `${name}_${uuid}_${timestamp}`;
 }
 
+// ── POI selection helpers ─────────────────────────────────────────────────────
+
+function nearestPoiIndex(position: Vector3, pois: Vector3[]): number {
+  let bestIdx = 0;
+  let bestDist = position.distanceTo(pois[0]!);
+  for (let i = 1; i < pois.length; i++) {
+    const d = position.distanceTo(pois[i]!);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  }
+  return bestIdx;
+}
+
+function angularBucket(fromPos: Vector3, toPoi: Vector3): string {
+  const dir = toPoi.clone().sub(fromPos).normalize();
+  const az = Math.atan2(dir.z, dir.x); // -π … π
+  const azBucket = Math.floor(((az / Math.PI + 1) * 4) % 8);
+  const elBucket = dir.y > 0.33 ? "u" : dir.y < -0.33 ? "d" : "m";
+  return `${azBucket}${elBucket}`;
+}
+
+function selectCoverageGreedyPoi(
+  position: Vector3,
+  pois: Vector3[],
+  coverage: Map<number, Set<string>>,
+): number {
+  let bestIdx = 0;
+  let bestScore = Infinity;
+  for (let i = 0; i < pois.length; i++) {
+    const seen = coverage.get(i) ?? new Set<string>();
+    const bucket = angularBucket(position, pois[i]!);
+    // Prefer the POI that adds a new viewing angle; tie-break by total coverage count.
+    const score = seen.has(bucket) ? seen.size + pois.length : seen.size;
+    if (score < bestScore) { bestScore = score; bestIdx = i; }
+  }
+  return bestIdx;
+}
+
+function updatePoiCoverage(
+  coverage: Map<number, Set<string>>,
+  poiIdx: number,
+  fromPos: Vector3,
+  pois: Vector3[],
+): void {
+  if (!coverage.has(poiIdx)) coverage.set(poiIdx, new Set());
+  coverage.get(poiIdx)!.add(angularBucket(fromPos, pois[poiIdx]!));
+}
+
 // ── capture loop ─────────────────────────────────────────────────────────────
 
 export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
-  const { gl, camera, scene, stream, captureDuration, fps, preCaptureDelayMs, assetUuid, assetName, timestamp, folderName, pathWaypoints } = cfg;
+  const {
+    gl, camera, scene, stream,
+    captureDuration, fps, preCaptureDelayMs,
+    assetUuid, assetName, timestamp, folderName,
+    pathWaypoints,
+  } = cfg;
+  const captureMode = cfg.captureMode ?? CaptureMode.Rig;
+  const pois = cfg.pointsOfInterest ?? [];
+
   const intervalMs        = 1000 / fps;
   const captureDurationMs = captureDuration * 1000;
 
@@ -52,9 +129,8 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
   const w = glCtx.drawingBufferWidth;
   const h = glCtx.drawingBufferHeight;
 
-  const target      = new WebGLRenderTarget(w, h, { depthBuffer: false, stencilBuffer: false });
-  const targetDepth = new WebGLRenderTarget(w, h, { type: FloatType, format: RedFormat });
-  const encCanvas   = document.createElement("canvas");
+  const target    = new WebGLRenderTarget(w, h, { depthBuffer: false, stencilBuffer: false });
+  const encCanvas = document.createElement("canvas");
   encCanvas.width   = w;
   encCanvas.height  = h;
   const enc2d = encCanvas.getContext("2d")!;
@@ -65,9 +141,24 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
     ? new Vector3(bounds.center[0] ?? 0, bounds.center[1] ?? 0, bounds.center[2] ?? 0)
     : new Vector3();
 
+  // Depth encoding range derived from stream bounds — tuned to the actual scene
+  // depth range rather than the full near-far clip span.
+  const bound    = Math.max(...(bounds?.size ?? [1, 1, 1]), 1);
+  const depthMin = Math.max(0.01, bound * DEPTH_NEAR_FACTOR);
+  const depthMax = Math.max(depthMin + 1e-3, bound * DEPTH_FAR_FACTOR);
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const modelRoot = (stream as any).children[0];
   const prevMode: string = modelRoot?._renderMode ?? "Splats";
+
+  const poiVectors = pois.map(([x, y, z]) => new Vector3(x, y, z));
+  const useRig = captureMode === CaptureMode.Rig;
+  // Rig mode: gaze the octree-refinement camera at the first POI if provided,
+  // else the scene bounds center.
+  const gazeTarget = useRig && poiVectors.length > 0 ? poiVectors[0]! : streamCenter;
+
+  // Coverage map for CoverageGreedy: poiIndex → set of angular-bucket strings seen.
+  const coverage = new Map<number, Set<string>>();
 
   const frameDataList: FrameData[] = [];
   const capturePositions: Vector3[] = [];
@@ -80,7 +171,11 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
     const [sx = 0, sy = 0, sz = 0] = pathWaypoints![0];
     camera.position.set(sx, sy, sz);
   }
-  camera.lookAt(streamCenter);
+  camera.lookAt(
+    !useRig && poiVectors.length > 0
+      ? poiVectors[nearestPoiIndex(camera.position, poiVectors)]!
+      : gazeTarget,
+  );
   camera.updateMatrixWorld(true);
   gl.render(scene, camera);
 
@@ -90,6 +185,8 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
   // Moves the offscreen camera continuously along the path for the full capture
   // duration, starting only after the pre-capture delay. This drives MirisStream
   // progressive refinement between captures.
+  // For nearest_poi / coverage_greedy the scene camera is also the capture
+  // camera, so the rAF keeps the stream refining toward the nearest POI.
   let rafHandle = -1;
   let rafStartTime: number | null = null;
 
@@ -99,7 +196,11 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
       const t   = Math.min(1, (now - rafStartTime) / captureDurationMs);
       const pos = interpolatePath(pathWaypoints!, t);
       camera.position.copy(pos);
-      camera.lookAt(streamCenter);
+      camera.lookAt(
+        !useRig && poiVectors.length > 0
+          ? poiVectors[nearestPoiIndex(camera.position, poiVectors)]!
+          : gazeTarget,
+      );
       camera.updateMatrixWorld(true);
       gl.render(scene, camera);
       if (t < 1) rafHandle = requestAnimationFrame(tick);
@@ -112,7 +213,7 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
   // Uses wall-clock slot scheduling: after each capture, skip forward to the
   // next future slot so that slow renders don't cause the run to exceed the
   // requested duration — they simply reduce the number of captures taken.
-  const camLabel     = `, ${RIG_CAMERAS.length} cameras`;
+  const camLabel     = useRig ? `, ${RIG_CAMERAS.length} cameras` : ", 1 camera";
   const captureStart = performance.now();
   let captureCount   = 0;
   let slotIndex      = 0;
@@ -129,106 +230,158 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
       const elapsed = performance.now() - captureStart;
       if (elapsed >= captureDurationMs) break;
 
-      const position = camera.position.clone();
-      const entries = RIG_CAMERAS.map(rig => ({
-        camName:   rig.name,
-        renderCam: createRigCamera(position, rig.direction, camera),
-      }));
+      const readback    = new Uint8Array(w * h * 4);
+      const pngItems:  { filename: string; png_base64: string }[] = [];
+      const jsonItems: { filename: string; json_str:   string }[] = [];
+      const stepFrameData: FrameData[] = [];
+      const frameStr   = String(captureCount + 1).padStart(4, "0");
+      const prevTarget = gl.getRenderTarget();
 
-      const visibleEntries = entries.filter(({ renderCam }) =>
-        isCameraVisible(renderCam as PerspectiveCamera, bounds),
-      );
+      if (useRig) {
+        // ── CaptureMode.Rig: 10-camera rig ───────────────────────────────
+        const position = camera.position.clone();
+        const entries = RIG_CAMERAS.map(rig => ({
+          camName:   rig.name,
+          renderCam: createRigCamera(position, rig.direction, camera),
+        }));
+        const visibleEntries = entries.filter(({ renderCam }) =>
+          isCameraVisible(renderCam as PerspectiveCamera, bounds),
+        );
 
-      if (visibleEntries.length > 0) {
-        const frameStr   = String(captureCount + 1).padStart(4, "0");
-        const prevTarget = gl.getRenderTarget();
+        if (visibleEntries.length > 0) {
+          type CapturedEntry = { camName: string | undefined; renderCam: PerspectiveCamera; colorPng: string };
+          const captured: CapturedEntry[] = [];
 
-        const pngItems:  { filename: string; png_base64:  string }[] = [];
-        const npyItems:  { filename: string; data_base64: string }[] = [];
-        const jsonItems: { filename: string; json_str:    string }[] = [];
-        const stepFrameData: FrameData[] = [];
-
-        // Pass 1 — color: render each visible camera and isEmpty-filter.
-        // Collect survivors into `captured` for the depth pass.
-        type CapturedEntry = { camName: string | undefined; renderCam: PerspectiveCamera; colorPng: string };
-        const captured: CapturedEntry[] = [];
-
-        for (const { camName, renderCam } of visibleEntries) {
-          gl.setRenderTarget(target);
-          gl.setClearColor(0x000000, 0);
-          gl.clear(true, true, false);
-          gl.render(scene, renderCam);
-          const rgba = new Uint8Array(w * h * 4);
-          gl.readRenderTargetPixels(target, 0, 0, w, h, rgba);
-
-          // Discard frames where no splat covered any pixel (frustum false-positive).
-          if (isEmpty(rgba)) { skippedEmpty++; continue; }
-
-          captured.push({ camName, renderCam: renderCam as PerspectiveCamera, colorPng: encodePng(enc2d, encCanvas, rgba, w, h) });
-        }
-
-        // Pass 2 — depth: switch render mode ONCE for the whole frame.
-        // Per-camera _setRenderMode toggles walk every splat child and rewrite
-        // its material, exhausting GPU resources with many cameras per frame.
-        const depthData: Float32Array[] = new Array(captured.length);
-        if (captured.length > 0) {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (stream as any)._setRenderMode("SplatDepthColor");
-          try {
-            for (let ci = 0; ci < captured.length; ci++) {
-              const { renderCam } = captured[ci];
-              gl.setRenderTarget(targetDepth);
-              gl.clear(true, true, false);
-              gl.render(scene, renderCam);
-              const df = new Float32Array(w * h);
-              gl.readRenderTargetPixels(targetDepth, 0, 0, w, h, df);
-              depthData[ci] = df;
-            }
-          } finally {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (stream as any)._setRenderMode(prevMode);
+          // Pass 1 — color
+          for (const { camName, renderCam } of visibleEntries) {
+            gl.setRenderTarget(target);
+            gl.setClearColor(0x000000, 0);
+            gl.clear(true, true, false);
+            gl.render(scene, renderCam);
+            gl.readRenderTargetPixels(target, 0, 0, w, h, readback);
+            if (isEmpty(readback)) { skippedEmpty++; continue; }
+            captured.push({ camName, renderCam: renderCam as PerspectiveCamera, colorPng: encodePng(enc2d, encCanvas, readback, w, h) });
           }
-        }
 
-        // Build batch items from the captured color + depth pairs.
-        for (let ci = 0; ci < captured.length; ci++) {
-          const { camName, renderCam, colorPng } = captured[ci];
-          const depthFloat = depthData[ci];
+          // Pass 2 — depth
+          const depthPngs: string[] = new Array(captured.length);
+          if (captured.length > 0) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (stream as any)._setRenderMode("SplatDepthColor");
+            try {
+              for (let ci = 0; ci < captured.length; ci++) {
+                const { renderCam } = captured[ci];
+                gl.setRenderTarget(target);
+                gl.setClearColor(0x000000, 0);
+                gl.clear(true, true, false);
+                gl.render(scene, renderCam);
+                gl.readRenderTargetPixels(target, 0, 0, w, h, readback);
+                depthPngs[ci] = encodePng(enc2d, encCanvas, readback, w, h);
+              }
+            } finally {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              (stream as any)._setRenderMode(prevMode);
+            }
+          }
 
-          const colorFilename   = buildFilename(assetName, assetUuid, timestamp, "color",  frameStr, "png",  camName);
-          const depthFilename   = buildFilename(assetName, assetUuid, timestamp, "depth",  frameStr, "npy",  camName);
-          const camJsonFilename = buildFilename(assetName, assetUuid, timestamp, "camera", frameStr, "json", camName);
-
-          pngItems.push ({ filename: `${folderName}/${colorFilename}`,   png_base64:  colorPng });
-          npyItems.push ({ filename: `${folderName}/${depthFilename}`,   data_base64: encodeNpy(depthFloat, w, h) });
-          jsonItems.push({ filename: `${folderName}/${camJsonFilename}`, json_str:    JSON.stringify(buildCameraJson(renderCam, w, h, assetName, assetUuid, timestamp, frameStr, camName)) });
-
-          stepFrameData.push({
-            frame: captureCount,
-            ...(camName !== undefined ? { camera_name: camName } : {}),
-            color_filename:       `${folderName}/${colorFilename}`,
-            depth_filename:       `${folderName}/${depthFilename}`,
-            camera_json_filename: `${folderName}/${camJsonFilename}`,
-          });
-        }
-
-        gl.setRenderTarget(prevTarget);
-
-        if (pngItems.length > 0) {
-          const batchResult = await executeOperatorAndReturn(SAVE_BATCH_OP, { png_items: pngItems, npy_items: npyItems, json_items: jsonItems });
-          if (batchResult.status === "error") {
-            await executeOperator("@voxel51/operators/notify", {
-              message: `Frame ${frameStr}: batch save failed — ${batchResult.error as string}`,
-              variant: "warning",
+          for (let ci = 0; ci < captured.length; ci++) {
+            const { camName, renderCam, colorPng } = captured[ci];
+            const colorFilename   = buildFilename(assetName, assetUuid, timestamp, "color",  frameStr, "png",  camName);
+            const depthFilename   = buildFilename(assetName, assetUuid, timestamp, "depth",  frameStr, "png",  camName);
+            const camJsonFilename = buildFilename(assetName, assetUuid, timestamp, "camera", frameStr, "json", camName);
+            pngItems.push({ filename: `${folderName}/${colorFilename}`, png_base64: colorPng });
+            pngItems.push({ filename: `${folderName}/${depthFilename}`, png_base64: depthPngs[ci] });
+            jsonItems.push({ filename: `${folderName}/${camJsonFilename}`, json_str: JSON.stringify(buildCameraJson(
+              renderCam, w, h, assetName, assetUuid, timestamp, frameStr, camName,
+              { depth_filename: depthFilename, depth_min: depthMin, depth_max: depthMax, depth_encoding: DEPTH_ENCODING },
+            ))});
+            stepFrameData.push({
+              frame: captureCount,
+              ...(camName !== undefined ? { camera_name: camName } : {}),
+              color_filename:       `${folderName}/${colorFilename}`,
+              depth_filename:       `${folderName}/${depthFilename}`,
+              camera_json_filename: `${folderName}/${camJsonFilename}`,
             });
           }
         }
+      } else {
+        // ── CaptureMode.NearestPoi / CoverageGreedy: single scene camera ──
+        const poiIdx = poiVectors.length === 0 ? -1
+          : captureMode === CaptureMode.NearestPoi
+            ? nearestPoiIndex(camera.position, poiVectors)
+            : selectCoverageGreedyPoi(camera.position, poiVectors, coverage);
 
-        if (stepFrameData.length > 0) {
-          capturePositions.push(camera.position.clone());
-          frameDataList.push(...stepFrameData);
-          captureCount++;
+        camera.lookAt(poiIdx >= 0 ? poiVectors[poiIdx]! : streamCenter);
+        camera.updateMatrixWorld(true);
+
+        if (isCameraVisible(camera as PerspectiveCamera, bounds)) {
+          // Pass 1 — color
+          gl.setRenderTarget(target);
+          gl.setClearColor(0x000000, 0);
+          gl.clear(true, true, false);
+          gl.render(scene, camera);
+          gl.readRenderTargetPixels(target, 0, 0, w, h, readback);
+
+          if (isEmpty(readback)) {
+            skippedEmpty++;
+          } else {
+            const colorPng = encodePng(enc2d, encCanvas, readback, w, h);
+
+            // Pass 2 — depth
+            let depthPng = "";
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (stream as any)._setRenderMode("SplatDepthColor");
+            try {
+              gl.setRenderTarget(target);
+              gl.setClearColor(0x000000, 0);
+              gl.clear(true, true, false);
+              gl.render(scene, camera);
+              gl.readRenderTargetPixels(target, 0, 0, w, h, readback);
+              depthPng = encodePng(enc2d, encCanvas, readback, w, h);
+            } finally {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              (stream as any)._setRenderMode(prevMode);
+            }
+
+            const colorFilename   = buildFilename(assetName, assetUuid, timestamp, "color",  frameStr, "png");
+            const depthFilename   = buildFilename(assetName, assetUuid, timestamp, "depth",  frameStr, "png");
+            const camJsonFilename = buildFilename(assetName, assetUuid, timestamp, "camera", frameStr, "json");
+            pngItems.push({ filename: `${folderName}/${colorFilename}`, png_base64: colorPng });
+            pngItems.push({ filename: `${folderName}/${depthFilename}`, png_base64: depthPng });
+            jsonItems.push({ filename: `${folderName}/${camJsonFilename}`, json_str: JSON.stringify(buildCameraJson(
+              camera as PerspectiveCamera, w, h, assetName, assetUuid, timestamp, frameStr, undefined,
+              { depth_filename: depthFilename, depth_min: depthMin, depth_max: depthMax, depth_encoding: DEPTH_ENCODING },
+            ))});
+            stepFrameData.push({
+              frame: captureCount,
+              color_filename:       `${folderName}/${colorFilename}`,
+              depth_filename:       `${folderName}/${depthFilename}`,
+              camera_json_filename: `${folderName}/${camJsonFilename}`,
+            });
+
+            if (captureMode === CaptureMode.CoverageGreedy && poiIdx >= 0) {
+              updatePoiCoverage(coverage, poiIdx, camera.position, poiVectors);
+            }
+          }
         }
+      }
+
+      gl.setRenderTarget(prevTarget);
+
+      if (pngItems.length > 0) {
+        const batchResult = await executeOperatorAndReturn(SAVE_BATCH_OP, { png_items: pngItems, json_items: jsonItems });
+        if (batchResult.status === "error") {
+          await executeOperator("@voxel51/operators/notify", {
+            message: `Frame ${frameStr}: batch save failed — ${batchResult.error as string}`,
+            variant: "warning",
+          });
+        }
+      }
+
+      if (stepFrameData.length > 0) {
+        capturePositions.push(camera.position.clone());
+        frameDataList.push(...stepFrameData);
+        captureCount++;
       }
 
       // Advance to the next future slot, skipping any that the render consumed.
@@ -275,7 +428,6 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
   } finally {
     cancelAnimationFrame(rafHandle);
     target.dispose();
-    targetDepth.dispose();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (stream as any)._setRenderMode?.(prevMode);
   }
@@ -330,6 +482,13 @@ function buildFilename(
   return `${name}_${uuid}_${timestamp}_${frame}${camPart}_${channel}.${ext}`;
 }
 
+interface DepthMeta {
+  depth_filename: string;
+  depth_min: number;
+  depth_max: number;
+  depth_encoding: string;
+}
+
 function buildCameraJson(
   cam: PerspectiveCamera,
   w: number,
@@ -339,6 +498,7 @@ function buildCameraJson(
   timestamp: number,
   frameStr: string,
   camName?: string,
+  depthMeta?: DepthMeta,
 ): object {
   const fovRad = (cam.fov ?? 50) * (Math.PI / 180);
   const fy = h / 2 / Math.tan(fovRad / 2);
@@ -363,41 +523,15 @@ function buildCameraJson(
     camera_intrinsics: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
     world_to_camera: worldToCamera,
     image_path: buildFilename(assetName, assetUuid, timestamp, "color", frameStr, "png", camName),
+    depth_range: [cam.near ?? 0.1, cam.far ?? 2000],
     horizontal_aperture: null,
     source_coordinate_system: null,
     meters_per_unit: 1.0,
     frame: parseInt(frameStr, 10),
     clip_near: cam.near ?? 0.1,
     clip_far: cam.far ?? 2000,
-    depth_min: cam.near ?? 0.1,
-    depth_max: cam.far ?? 2000,
+    ...(depthMeta ?? {}),
   };
-}
-
-function encodeNpy(data: Float32Array, w: number, h: number): string {
-  const flipped   = flipVerticalFloat32(data, w, h);
-  const header    = `{'descr': '<f4', 'fortran_order': False, 'shape': (${h}, ${w}), }`;
-  const unpaddedTotal = 10 + header.length + 1;
-  const paddedTotal   = Math.ceil(unpaddedTotal / 64) * 64;
-  const headerPadded  = header.padEnd(header.length + (paddedTotal - unpaddedTotal), " ") + "\n";
-  const headerBytes   = new TextEncoder().encode(headerPadded);
-  const out  = new Uint8Array(10 + headerBytes.length + flipped.byteLength);
-  const view = new DataView(out.buffer);
-  out.set([0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59, 0x01, 0x00]);
-  view.setUint16(8, headerBytes.length, true);
-  out.set(headerBytes, 10);
-  out.set(new Uint8Array(flipped.buffer), 10 + headerBytes.length);
-  let binary = "";
-  for (let i = 0; i < out.length; i++) binary += String.fromCharCode(out[i]!);
-  return btoa(binary);
-}
-
-function flipVerticalFloat32(data: Float32Array, w: number, h: number): Float32Array {
-  const flipped = new Float32Array(data.length);
-  for (let y = 0; y < h; y++) {
-    flipped.set(data.subarray(y * w, (y + 1) * w), (h - 1 - y) * w);
-  }
-  return flipped;
 }
 
 function encodePng(

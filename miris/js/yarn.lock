@@ -430,10 +430,10 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@miris-inc/three@file:/C:/Users/DanielVijayakumar/Development/miris/aqua/modules/web_projects/packages/three::locator=%40miris-inc%2Fvoxel51%40workspace%3A.":
-  version: 0.0.0
-  resolution: "@miris-inc/three@file:/C%3A/Users/DanielVijayakumar/Development/miris/aqua/modules/web_projects/packages/three#/C%3A/Users/DanielVijayakumar/Development/miris/aqua/modules/web_projects/packages/three::hash=26f979&locator=%40miris-inc%2Fvoxel51%40workspace%3A."
-  checksum: 10c0/b212f6f2312ef7f80f6fc2b44dcbf24f986dbb1adcfbde56aa2fb03b9a4e761a989cd2ef85e8e30c67f19a432a387dd63f518328f5f0be8950b60b174fdfbf1a
+"@miris-inc/three@npm:latest":
+  version: 0.0.8-655ef21
+  resolution: "@miris-inc/three@npm:0.0.8-655ef21"
+  checksum: 10c0/d3036434fd640fae4bddf8ffb78fda7411d715ee920f9cb092acbd3815777529462b28ad4ad62dfdab7eaa509f07a6edd1c5163972e0fde3fa410f71a041e95c
   languageName: node
   linkType: hard
 
@@ -441,7 +441,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@miris-inc/voxel51@workspace:."
   dependencies:
-    "@miris-inc/three": "file:/C:/Users/DanielVijayakumar/Development/miris/aqua/modules/web_projects/packages/three"
+    "@miris-inc/three": "npm:latest"
     "@types/react": "npm:^18.2.0"
     "@types/react-dom": "npm:^18.2.0"
     "@types/three": "npm:^0.176.0"

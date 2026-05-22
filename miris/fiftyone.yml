@@ -18,5 +18,6 @@ operators:
   - save_capture_batch
   - save_camera_path_preview
   - segment_miris_stream_frames
+  - segment_miris_stream_frames_from_folder
   - generate_miris_labels
   - preview_camera_path

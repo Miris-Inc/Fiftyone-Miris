@@ -99,6 +99,8 @@ class _Pipeline:
 
         # Stage outputs (populated by run())
         self.all_frames: list = []
+        self._aabb_min: np.ndarray | None = None
+        self._aabb_max: np.ndarray | None = None
         self.pts_all = self.rgb_all = None
         self.seg_frame_list: list = []
         self.cache: CameraCache | None = None
@@ -119,36 +121,55 @@ class _Pipeline:
                 f"[data] {len(self.all_frames)} total frames  cam_stride={self.cam_stride}"
             )
 
-    def _hull_and_cloud(self) -> bool:
+    def _compute_hull(self):
         print("\n── Step 1: Hull AABB ─────────────────────────────────────────────")
-        strided = self.all_frames[::self.cam_stride]
+        result_box = [None]
         try:
-            aabb_min, aabb_max, _ = compute_hull_aabb(
-                self.all_frames, self.cam_stride, self.alpha_threshold,
-                aabb_pad=self.aabb_pad,
+            yield from _drive_generator(
+                compute_hull_aabb(
+                    self.all_frames, self.cam_stride, self.alpha_threshold,
+                    aabb_pad=self.aabb_pad,
+                ),
+                lambda done, total: (
+                    0.02 + done / total * (0.07 - 0.02),
+                    f"Dino+SAM2: computing scene bounds… {done}/{total}",
+                ),
+                set_result=lambda v: result_box.__setitem__(0, v),
             )
         except ValueError as exc:
             print(f"[ERROR] {exc}")
-            return False
-        print(
-            f"  min={[round(v, 3) for v in aabb_min.tolist()]}  "
-            f"max={[round(v, 3) for v in aabb_max.tolist()]}"
-        )
+            return
+        if result_box[0] is not None:
+            self._aabb_min, self._aabb_max, _ = result_box[0]
+            print(
+                f"  min={[round(v, 3) for v in self._aabb_min.tolist()]}  "
+                f"max={[round(v, 3) for v in self._aabb_max.tolist()]}"
+            )
 
+    def _build_cloud(self):
         # build_depth_cloud uses a strict alpha_threshold (0.95) by default;
         # soft splat edges have unreliable depth and would paint streaks.
         print("\n── Step 2: Depth → world-space cloud ─────────────────────────────")
+        result_box = [None]
         try:
-            self.pts_all, self.rgb_all = build_depth_cloud(
-                strided, aabb_min, aabb_max,
-                voxel_size=self.voxel_size,
-                depth_max=self.depth_max,
-                min_unique_cameras=self.min_unique_cameras,
+            yield from _drive_generator(
+                build_depth_cloud(
+                    self.all_frames[::self.cam_stride], self._aabb_min, self._aabb_max,
+                    voxel_size=self.voxel_size,
+                    depth_max=self.depth_max,
+                    min_unique_cameras=self.min_unique_cameras,
+                ),
+                lambda done, total: (
+                    0.07 + done / total * (0.22 - 0.07),
+                    f"Dino+SAM2: building depth cloud… {done}/{total}",
+                ),
+                set_result=lambda v: result_box.__setitem__(0, v),
             )
-            return True
         except ValueError as exc:
             print(f"[ERROR] {exc}")
-            return False
+            return
+        if result_box[0] is not None:
+            self.pts_all, self.rgb_all = result_box[0]
 
     def _select_seg_frames(self):
         if self.seg_frames <= 0 or self.seg_frames >= len(self.all_frames):
@@ -258,8 +279,11 @@ class _Pipeline:
             self._prepare()
             if not self.all_frames:
                 return None
-            yield 0.02, "Dino+SAM2: computing scene bounds…"
-            if not self._hull_and_cloud():
+            yield from self._compute_hull()
+            if self._aabb_min is None:
+                return None
+            yield from self._build_cloud()
+            if self.pts_all is None:
                 return None
             self._select_seg_frames()
             yield 0.22, "Dino+SAM2: running Grounding DINO…"

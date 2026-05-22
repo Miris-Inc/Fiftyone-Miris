@@ -126,14 +126,20 @@ def compute_hull_aabb(
     alpha_threshold: float = _ALPHA_FOREGROUND_LOOSE,
     percentile_trim: float = 1.0,
     aabb_pad: float = 0.15,
-) -> tuple[np.ndarray, np.ndarray, dict]:
+):
     """Coarse world-space AABB from alpha silhouettes (constant view-depth back-projection).
 
-    Loose but never wrong-side of the true surface — used as a spatial filter for the depth cloud."""
+    Generator: yields ``(done, total)`` after each frame for progress reporting.
+    Returns ``(lo, hi, info)`` via ``StopIteration.value``.
+    Raises ``ValueError`` if no foreground points are found.
+    """
     all_pts: list[np.ndarray] = []
-    for frame in frames[::cam_stride]:
+    strided = frames[::cam_stride]
+    total = len(strided)
+    for i, frame in enumerate(strided):
         color = cv2.imread(str(frame["color"]), cv2.IMREAD_UNCHANGED)
         if color is None or color.ndim != 3 or color.shape[2] < 4:
+            yield i + 1, total
             continue
         meta = _load_camera(frame["camera"])
         fg = (color[:, :, 3].astype(np.float32) / 255.0) >= alpha_threshold
@@ -142,6 +148,7 @@ def compute_hull_aabb(
         uu, vv = np.meshgrid(np.arange(0, W, 2), np.arange(0, H, 2))
         fg_s = fg[vv, uu]
         if fg_s.sum() == 0:
+            yield i + 1, total
             continue
         c2w = np.linalg.inv(np.array(meta["world_to_camera"], dtype=np.float64))
         cam_pos = (c2w @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
@@ -153,6 +160,7 @@ def compute_hull_aabb(
             z,
         )
         all_pts.append(pts)
+        yield i + 1, total
 
     if not all_pts:
         raise ValueError("Hull AABB: no foreground points.")
@@ -163,40 +171,6 @@ def compute_hull_aabb(
     pad = (hi - lo) * aabb_pad
     return lo - pad, hi + pad, {"world_min": lo.tolist(), "world_max": hi.tolist()}
 
-def _voxel_downsample(
-    pts: np.ndarray,
-    rgbs: np.ndarray,
-    voxel_size: float,
-    frame_indices: Optional[np.ndarray] = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
-    """Returns ``(pts, rgbs, pix_counts, cam_counts)``.
-
-    ``cam_counts`` (distinct source frames per voxel) is the multi-view-consensus signal: it
-    separates real surface (many cameras converging) from splat-center streaks (one camera,
-    many ray pixels in the same voxel neighbourhood) that pix_count alone can't tell apart.
-    """
-    if pts.shape[0] == 0:
-        z = np.zeros(0, dtype=np.int64)
-        return pts, rgbs, z, (z if frame_indices is not None else None)
-    idx = np.floor(pts / voxel_size).astype(np.int64)
-    _, inv, pix_counts = np.unique(idx, axis=0, return_inverse=True, return_counts=True)
-    n = pix_counts.shape[0]
-    p_out = np.zeros((n, 3))
-    r_out = np.zeros((n, 3))
-    np.add.at(p_out, inv, pts)
-    np.add.at(r_out, inv, rgbs.astype(np.float64))
-    p_out /= pix_counts[:, None]
-    r_out /= pix_counts[:, None]
-
-    cam_counts: Optional[np.ndarray] = None
-    if frame_indices is not None:
-        # Distinct cameras per voxel: dedup (voxel_id, frame_idx) pairs, then
-        # bin by voxel_id.
-        pair = np.stack([inv, frame_indices.astype(np.int64)], axis=1)
-        unique_pairs = np.unique(pair, axis=0)
-        cam_counts = np.bincount(unique_pairs[:, 0], minlength=n)
-
-    return p_out, r_out.astype(np.uint8), pix_counts, cam_counts
 
 def build_depth_cloud(
     frames: list[dict],
@@ -206,27 +180,38 @@ def build_depth_cloud(
     voxel_size: float = _DEFAULT_VOXEL_SIZE_M,
     depth_max: Optional[float] = None,
     min_unique_cameras: int = 3,
-) -> tuple[np.ndarray, np.ndarray]:
+):
     """Unproject per-frame depth → world, AABB-filter, voxel-downsample, consensus-filter.
+
+    Generator: yields ``(done, total)`` after each frame for progress reporting.
+    Returns ``(pts_world, rgb)`` via ``StopIteration.value``.
+    Raises ``ValueError`` if no points are produced.
 
     ``min_unique_cameras`` is the consensus filter — voxels with hits from N *distinct* frames
     are real surface; one camera shooting many pixels along a streak hits one voxel many times
     but with cam_count=1.
+
+    Per-frame voxelization bounds peak memory to (unique_voxels_per_frame × n_frames) rather
+    than (raw_pixels × n_frames), avoiding OOM on large captures.
     """
-    all_pts: list[np.ndarray] = []
-    all_rgb: list[np.ndarray] = []
-    all_cam: list[np.ndarray] = []
+    vox_idx_list: list[np.ndarray] = []
+    vox_pts_list: list[np.ndarray] = []
+    vox_rgb_list: list[np.ndarray] = []
+    vox_cam_list: list[np.ndarray] = []
     n_skipped = 0
+    total = len(frames)
 
     for i, frame in enumerate(frames):
         depth_path = frame.get("depth")
         if depth_path is None:
             n_skipped += 1
+            yield i + 1, total
             continue
 
         bgra = cv2.imread(str(frame["color"]), cv2.IMREAD_UNCHANGED)
         if bgra is None or bgra.shape[2] < 4:
             n_skipped += 1
+            yield i + 1, total
             continue
 
         meta = _load_camera(frame["camera"])
@@ -234,10 +219,11 @@ def build_depth_cloud(
         try:
             dmin = float(meta.get("depth_min", 0.01))
             dmax = float(meta.get("depth_max", 1000.0))
-            depth = load_depth_map(pathlib.Path(depth_path), dmin, dmax)
+            depth = load_depth_map(depth_path, dmin, dmax)
         except (IOError, Exception) as exc:
             print(f"[depth] frame {i}: {exc}")
             n_skipped += 1
+            yield i + 1, total
             continue
 
         alpha = bgra[:, :, 3].astype(np.float32) / 255.0
@@ -245,10 +231,12 @@ def build_depth_cloud(
 
         pts, pix = unproject_depth_to_world(depth, meta, fg, max_depth=depth_max)
         if pts.shape[0] == 0:
+            yield i + 1, total
             continue
 
         in_box = (pts >= aabb_min).all(axis=1) & (pts <= aabb_max).all(axis=1)
         if not in_box.any():
+            yield i + 1, total
             continue
         pts = pts[in_box]
         pix = pix[in_box]
@@ -256,27 +244,62 @@ def build_depth_cloud(
         # cv2 reads BGR; reverse the channel slice to RGB.
         rgb = bgra[pix[:, 1], pix[:, 0], 2::-1].astype(np.uint8)
 
-        all_pts.append(pts)
-        all_rgb.append(rgb)
-        all_cam.append(np.full(pts.shape[0], i, dtype=np.int32))
+        # Voxelize this frame immediately before accumulation. np.unique on ~1M
+        # pixels collapses to ~10-50K unique voxels, so the lists we accumulate
+        # are 20-100× smaller than the raw pixel arrays.
+        grid = np.floor(pts / voxel_size).astype(np.int64)
+        unique_rows, inv, counts = np.unique(
+            grid, axis=0, return_inverse=True, return_counts=True
+        )
+        n_vox = unique_rows.shape[0]
+        p_vox = np.zeros((n_vox, 3), dtype=np.float64)
+        r_vox = np.zeros((n_vox, 3), dtype=np.float64)
+        np.add.at(p_vox, inv, pts)
+        np.add.at(r_vox, inv, rgb.astype(np.float64))
+        p_vox /= counts[:, None]
+        r_vox /= counts[:, None]
 
-    if not all_pts:
+        vox_idx_list.append(unique_rows)
+        vox_pts_list.append(p_vox)
+        vox_rgb_list.append(r_vox.clip(0, 255).astype(np.uint8))
+        vox_cam_list.append(np.full(n_vox, i, dtype=np.int32))
+        yield i + 1, total
+
+    if not vox_pts_list:
         raise ValueError(
             f"build_depth_cloud: no points produced "
             f"({len(frames)} frames, {n_skipped} skipped)"
         )
 
-    pts_all = np.concatenate(all_pts, axis=0)
-    rgb_all = np.concatenate(all_rgb, axis=0)
-    cam_all = np.concatenate(all_cam, axis=0)
-    print(f"[depth] Raw: {pts_all.shape[0]:,} pts from {len(frames) - n_skipped} frames")
-
-    pts_all, rgb_all, _pix_counts, cam_counts = _voxel_downsample(
-        pts_all, rgb_all, voxel_size, frame_indices=cam_all
+    all_idx = np.concatenate(vox_idx_list, axis=0)
+    all_pts = np.concatenate(vox_pts_list, axis=0)
+    all_rgb = np.concatenate(vox_rgb_list, axis=0)
+    all_cam = np.concatenate(vox_cam_list, axis=0)
+    print(
+        f"[depth] Pre-merge unique voxels: {all_idx.shape[0]:,} "
+        f"from {len(frames) - n_skipped} frames"
     )
-    print(f"[depth] After voxel dedup: {pts_all.shape[0]:,} (voxel {voxel_size} m)")
 
-    if min_unique_cameras > 1 and pts_all.shape[0] > 0 and cam_counts is not None:
+    # Global merge across frames.
+    _, inv, counts = np.unique(all_idx, axis=0, return_inverse=True, return_counts=True)
+    n_final = counts.shape[0]
+    p_out = np.zeros((n_final, 3), dtype=np.float64)
+    r_out = np.zeros((n_final, 3), dtype=np.float64)
+    np.add.at(p_out, inv, all_pts)
+    np.add.at(r_out, inv, all_rgb.astype(np.float64))
+    p_out /= counts[:, None]
+    r_out /= counts[:, None]
+
+    # Distinct frames per final voxel for multi-view consensus.
+    pair = np.stack([inv, all_cam.astype(np.int64)], axis=1)
+    unique_pairs = np.unique(pair, axis=0)
+    cam_counts = np.bincount(unique_pairs[:, 0], minlength=n_final)
+
+    pts_all = p_out
+    rgb_all = r_out.clip(0, 255).astype(np.uint8)
+    print(f"[depth] After global merge: {pts_all.shape[0]:,} (voxel {voxel_size} m)")
+
+    if min_unique_cameras > 1 and pts_all.shape[0] > 0:
         keep = cam_counts >= min_unique_cameras
         pts_all = pts_all[keep]
         rgb_all = rgb_all[keep]

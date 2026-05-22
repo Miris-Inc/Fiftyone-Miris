@@ -36,7 +36,7 @@ def _captures_dir(dataset_name: str) -> str:
 
 from .python.save_capture import SaveCaptureBatch
 from .python.save_camera_path_preview import SaveCameraPathPreview
-from .python.segment_miris_stream_frames import SegmentMirisStreamFrames
+from .python.segment_miris_stream_frames import SegmentMirisStreamFrames, SegmentMirisStreamFramesFromFolder
 
 
 def _cache_thumbnail(uuid: str, url: str, dataset_name: str) -> str | None:
@@ -174,3 +174,4 @@ def register(p):
     p.register(SaveCaptureBatch)
     p.register(SaveCameraPathPreview)
     p.register(SegmentMirisStreamFrames)
+    p.register(SegmentMirisStreamFramesFromFolder)

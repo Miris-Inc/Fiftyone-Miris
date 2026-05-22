@@ -1,7 +1,7 @@
 import { Operator, OperatorConfig, ExecutionContext, executeOperator, types } from "@fiftyone/operators";
 import { useRecoilValue } from "recoil";
 import * as fos from "@fiftyone/state";
-import { runCapture, sanitizeName, buildRunFolder, type CaptureConfig } from "./captureStreamFrames";
+import { runCapture, sanitizeName, buildRunFolder, CaptureMode, type CaptureConfig } from "./captureStreamFrames";
 import { setupOffscreenScene } from "./offscreenScene";
 import { DEFAULT_VIEWER_KEY } from "./syncMirisAssets";
 import { executeOperatorAndReturn } from "./utils";
@@ -39,7 +39,12 @@ export class GenerateMirisLabels extends Operator {
     });
     inputs.str("path_waypoints", {
       label: "Camera Path Waypoints (JSON)",
-      description: 'Optional sequence of 3D points [[x,y,z],...] defining a camera rig path. 10 rig cameras fire at each stop. Leave empty to re-use wp* cuboids on the sample, or to use a single default-framed view.',
+      description: 'Optional sequence of 3D points [[x,y,z],...] defining a camera path. Leave empty to re-use wp* cuboids on the sample, or to use a single default-framed view.',
+      required: false,
+    });
+    inputs.str("points_of_interest", {
+      label: "Points of Interest (JSON)",
+      description: 'Optional list of 3D gaze targets [[x,y,z],...]. In rig mode, a single point overrides the default scene-center gaze. In nearest_poi / coverage_greedy modes the camera gazes at one of these targets each capture slot.',
       required: false,
     });
     inputs.int("capture_duration", {
@@ -50,8 +55,14 @@ export class GenerateMirisLabels extends Operator {
     });
     inputs.int("capture_rate", {
       label: "Capture rate (fps)",
-      description: "Captures per second of path duration (1–10). Total stops = duration × rate, each firing 10 rig cameras.",
+      description: "Captures per second of path duration (1–10).",
       default: 2,
+      required: false,
+    });
+    inputs.enum("capture_mode", Object.values(CaptureMode), {
+      label: "Capture mode",
+      description: "rig = waypoints + 10-camera rig (scene camera gazes at POI or center). nearest_poi = single camera gazes at the closest POI each slot. coverage_greedy = single camera gazes at the least-covered POI each slot.",
+      default: CaptureMode.Rig,
       required: false,
     });
     return new types.Property(inputs);
@@ -96,14 +107,29 @@ export class GenerateMirisLabels extends Operator {
       pathWaypoints = readWaypointsFromSample(sample);
     }
 
+    let pointsOfInterest: [number, number, number][] | undefined;
+    const poisRaw = ((ctx.params.points_of_interest as string | undefined) ?? "").trim();
+    if (poisRaw) {
+      try {
+        pointsOfInterest = JSON.parse(poisRaw) as [number, number, number][];
+      } catch {
+        executeOperator("@voxel51/operators/notify", {
+          message: "points_of_interest is not valid JSON — ignoring.",
+          variant: "warning",
+        });
+      }
+    }
+
     const captureDuration = Math.min(1000, Math.max(1,  ((ctx.params.capture_duration as number | undefined) ?? 30)));
     const captureRate     = Math.min(10,   Math.max(1,  ((ctx.params.capture_rate     as number | undefined) ?? 2)));
+    const captureMode     = (ctx.params.capture_mode as CaptureMode | undefined) ?? CaptureMode.Rig;
 
     // Fire-and-forget: execute() returns immediately so the modal closes and the
     // user can freely interact with the scene while the pipeline runs.
     runPipeline({
       assetUuid, viewerKey, assetName, datasetName,
-      captureDuration, fps: captureRate, timestamp, dinoText, pathWaypoints,
+      captureDuration, fps: captureRate, timestamp, dinoText,
+      pathWaypoints, captureMode, pointsOfInterest,
     }).catch((err: unknown) => {
       console.error("[GenerateMirisLabels]", err);
       executeOperator("@voxel51/operators/notify", {
@@ -126,6 +152,8 @@ interface PipelineArgs {
   timestamp: number;
   dinoText: string;
   pathWaypoints?: [number, number, number][];
+  captureMode: CaptureMode;
+  pointsOfInterest?: [number, number, number][];
 }
 
 async function runPipeline(args: PipelineArgs): Promise<void> {
@@ -136,8 +164,10 @@ async function runPipeline(args: PipelineArgs): Promise<void> {
     assetName: args.assetName,
     captureDuration: args.captureDuration,
     fps: args.fps,
+    captureMode: args.captureMode,
     hasWaypoints: !!args.pathWaypoints?.length,
     waypointCount: args.pathWaypoints?.length ?? 0,
+    poiCount: args.pointsOfInterest?.length ?? 0,
   });
 
   await executeOperator("@voxel51/operators/notify", {
@@ -169,6 +199,8 @@ async function runPipeline(args: PipelineArgs): Promise<void> {
       timestamp: args.timestamp,
       folderName,
       pathWaypoints: args.pathWaypoints,
+      captureMode: args.captureMode,
+      pointsOfInterest: args.pointsOfInterest,
     };
     const frameData = await runCapture(captureConfig);
     console.log("[GenerateMirisLabels] capture done,", frameData.length, "frame entries; starting segmentation");
