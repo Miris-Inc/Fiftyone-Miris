@@ -5,7 +5,15 @@ import fiftyone.operators as foo
 import fiftyone.operators.types as types
 
 from .. import _captures_dir
-from .segmentation import run_dino_sam2_pipeline
+from .segmentation import run_dino_sam2_pipeline, run_sam3_pipeline
+
+
+# Supported 2-D detection/segmentation backends. Default stays on "dino_sam2"
+# (Grounding DINO + SAM2) so existing callers behave identically; pass
+# ``method="sam3"`` to opt into the SAM3 backend.
+_METHOD_DINO_SAM2 = "dino_sam2"
+_METHOD_SAM3 = "sam3"
+_VALID_METHODS = (_METHOD_DINO_SAM2, _METHOD_SAM3)
 
 
 def _fail(ctx, message: str, exc: BaseException | None = None, variant: str = "error"):
@@ -41,7 +49,19 @@ class SegmentMirisStreamFrames(foo.Operator):
             "dino_text",
             required=True,
             label="Object classes",
-            description="Grounding DINO text prompt, e.g. 'Phone. Laptop.'",
+            description="Text prompt, e.g. 'Phone. Laptop.'",
+        )
+        inputs.enum(
+            "method",
+            values=list(_VALID_METHODS),
+            default=_METHOD_DINO_SAM2,
+            required=False,
+            label="Segmentation method",
+            description=(
+                "Backend used for 2-D detection+segmentation. "
+                "'dino_sam2' (default) uses Grounding DINO + SAM2; "
+                "'sam3' uses the single-model SAM3 text-prompted segmenter."
+            ),
         )
         return types.Property(inputs)
 
@@ -54,6 +74,7 @@ class SegmentMirisStreamFrames(foo.Operator):
         asset_name = ctx.params.get("asset_name", "unknown")
         asset_uuid = ctx.params.get("asset_uuid", "")
         dino_text = ctx.params["dino_text"]
+        method = ctx.params.get("method") or _METHOD_DINO_SAM2
 
         if not frames:
             yield from _fail(ctx, f'Segmentation failed for "{asset_name}" — no frames captured.')
@@ -72,26 +93,49 @@ class SegmentMirisStreamFrames(foo.Operator):
         output_dir.mkdir(parents=True, exist_ok=True)
 
         yield from _run_pipeline_generator(
-            ctx, frames, base_dir, output_dir, asset_name, asset_uuid, dino_text
+            ctx, frames, base_dir, output_dir, asset_name, asset_uuid, dino_text,
+            method=method,
         )
 
 
-def _run_pipeline_generator(ctx, frames, base_dir, output_dir, asset_name, asset_uuid, dino_text):
-    # Use every captured frame for both depth-cloud build and DINO+SAM2
-    # inference. seg_frames=0 makes the pipeline fall through to the full
-    # frame list.
+def _run_pipeline_generator(
+    ctx, frames, base_dir, output_dir, asset_name, asset_uuid, dino_text,
+    method: str = _METHOD_DINO_SAM2,
+):
+    if method not in _VALID_METHODS:
+        yield ctx.log(
+            f"[segment] unknown method={method!r}; falling back to {_METHOD_DINO_SAM2!r}"
+        )
+        method = _METHOD_DINO_SAM2
+
+    # Use every captured frame for both depth-cloud build and 2-D
+    # detection/segmentation. seg_frames=0 makes the pipeline fall through to
+    # the full frame list.
     yield ctx.log(
-        f"[segment] output_dir={output_dir} frames={len(frames)} (all)"
+        f"[segment] output_dir={output_dir} frames={len(frames)} (all) method={method}"
     )
-    gen = run_dino_sam2_pipeline(
-        output_dir=output_dir,
-        frames=frames,
-        base_dir=base_dir,
-        dino_text=dino_text,
-        cam_stride=1,
-        seg_frames=0,
-        visualize=False,
-    )
+    if method == _METHOD_SAM3:
+        gen = run_sam3_pipeline(
+            output_dir=output_dir,
+            frames=frames,
+            base_dir=base_dir,
+            sam3_text=dino_text,
+            cam_stride=1,
+            seg_frames=0,
+            visualize=False,
+        )
+        backend_name = "SAM3"
+    else:
+        gen = run_dino_sam2_pipeline(
+            output_dir=output_dir,
+            frames=frames,
+            base_dir=base_dir,
+            dino_text=dino_text,
+            cam_stride=1,
+            seg_frames=0,
+            visualize=False,
+        )
+        backend_name = "DINO/SAM2"
 
     results = None
     try:
@@ -116,12 +160,12 @@ def _run_pipeline_generator(ctx, frames, base_dir, output_dir, asset_name, asset
     if not results:
         yield ctx.log(
             f"[segment] {asset_name}: pipeline returned no detections — "
-            f"nothing to save. Usually means DINO/SAM2 found nothing "
+            f"nothing to save. Usually means {backend_name} found nothing "
             f"matching the text prompt."
         )
         yield from _fail(ctx,
             f'No detections found for "{asset_name}". '
-            f"DINO found no objects matching the text prompt, or the depth cloud "
+            f"{backend_name} found no objects matching the text prompt, or the depth cloud "
             f"could not be built (check the console for details).",
             variant="warning",
         )
@@ -235,7 +279,7 @@ class SegmentMirisStreamFramesFromFolder(foo.Operator):
             "dino_text",
             required=True,
             label="Object classes",
-            description="Grounding DINO text prompt, e.g. 'Phone. Laptop.'",
+            description="Text prompt, e.g. 'Phone. Laptop.'",
         )
         inputs.str(
             "frames_folder",
@@ -243,11 +287,24 @@ class SegmentMirisStreamFramesFromFolder(foo.Operator):
             label="Frames folder",
             description="Path to folder containing captured frame images",
         )
+        inputs.enum(
+            "method",
+            values=list(_VALID_METHODS),
+            default=_METHOD_DINO_SAM2,
+            required=False,
+            label="Segmentation method",
+            description=(
+                "Backend used for 2-D detection+segmentation. "
+                "'dino_sam2' (default) uses Grounding DINO + SAM2; "
+                "'sam3' uses the single-model SAM3 text-prompted segmenter."
+            ),
+        )
         return types.Property(inputs)
 
     def execute(self, ctx):
         dino_text = ctx.params["dino_text"]
         base_dir = pathlib.Path(ctx.params["frames_folder"])
+        method = ctx.params.get("method") or _METHOD_DINO_SAM2
 
         if not ctx.current_sample:
             yield from _fail(ctx, "No sample is currently loaded. Open a sample in the modal before running this operator.")
@@ -286,5 +343,6 @@ class SegmentMirisStreamFramesFromFolder(foo.Operator):
         output_dir.mkdir(parents=True, exist_ok=True)
 
         yield from _run_pipeline_generator(
-            ctx, frames, base_dir, output_dir, asset_name, asset_uuid, dino_text
+            ctx, frames, base_dir, output_dir, asset_name, asset_uuid, dino_text,
+            method=method,
         )

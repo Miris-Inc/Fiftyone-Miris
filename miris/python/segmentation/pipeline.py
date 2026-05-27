@@ -1,4 +1,9 @@
-"""End-to-end DINO + SAM2 + depth pipeline. Public entrypoint: ``run_dino_sam2_pipeline``."""
+"""End-to-end DINO + SAM2 + depth pipeline. Public entrypoint: ``run_dino_sam2_pipeline``.
+
+Also exposes ``run_sam3_pipeline``: same pipeline but replaces the DINO + SAM2 pair with a single
+SAM3 call (text-promptable detector + segmenter). The geometry / labelling / AABB stages are
+identical, so downstream code is untouched.
+"""
 from __future__ import annotations
 
 import pathlib
@@ -17,6 +22,7 @@ from .detection import (
     run_dino_on_frames,
     run_sam2_on_frames,
 )
+from .detection_sam3 import SAM3_MODEL, run_sam3_on_frames
 from .geometry import (
     CameraCache,
     _resolve_frame_list,
@@ -311,3 +317,99 @@ def run_dino_sam2_pipeline(output_dir, frames, base_dir=None, *, dino_text: str,
     Returns ``{"detections": [...]}`` via ``StopIteration.value``, or ``None`` if no detections.
     """
     return _Pipeline(output_dir, frames, base_dir, dino_text=dino_text, **kwargs).run()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SAM3 pipeline (drop-in replacement for DINO + SAM2)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _Sam3Pipeline(_Pipeline):
+    """SAM3 variant: text-prompted segmentation produces ``all_dets`` and ``label_maps`` in one stage.
+
+    Reuses every other stage (hull, depth cloud, label assignment, AABB fitting,
+    save, final result) from ``_Pipeline`` without modification — only the 2-D
+    detection/segmentation stage differs.
+    """
+
+    def __init__(
+        self,
+        output_dir,
+        frames,
+        base_dir=None,
+        *,
+        sam3_text: str,
+        sam3_model: str = SAM3_MODEL,
+        sam3_score_threshold: float = 0.3,
+        **kwargs,
+    ):
+        # ``_Pipeline.__init__`` requires ``dino_text``; satisfy it with the SAM3 prompt
+        # so the (unused) DINO knobs don't break instantiation. The actual prompt
+        # routed to SAM3 lives in ``self.sam3_text``.
+        kwargs.setdefault("dino_text", sam3_text)
+        super().__init__(output_dir, frames, base_dir, **kwargs)
+        self.sam3_text = sam3_text
+        self.sam3_model = sam3_model
+        self.sam3_score_threshold = sam3_score_threshold
+
+    def _sam3(self):
+        """Single-stage SAM3 detection + segmentation; produces both ``all_dets`` and ``label_maps``."""
+        def _set_both(value):
+            dets, lmaps = value
+            self.all_dets = dets
+            self.label_maps = lmaps
+
+        yield from _drive_generator(
+            run_sam3_on_frames(
+                self.seg_frame_list, self.device,
+                sam3_text=self.sam3_text,
+                score_threshold=self.sam3_score_threshold,
+            ),
+            lambda done, total: (
+                0.22 + done / total * (0.82 - 0.22),
+                f"SAM3: detecting + segmenting {done}/{total}…",
+            ),
+            set_result=_set_both,
+        )
+
+    def run(self):
+        """Drive the SAM3 pipeline, yielding ``(progress, label)`` at each stage.
+
+        Mirrors ``_Pipeline.run`` (so we get the same hull + depth-cloud progress
+        plumbing introduced on dvj-camera-depth) but replaces the DINO + SAM2
+        stages with a single SAM3 call.
+        """
+        try:
+            yield 0.01, "SAM3: starting"
+            self._prepare()
+            if not self.all_frames:
+                return None
+            yield from self._compute_hull()
+            if self._aabb_min is None:
+                return None
+            yield from self._build_cloud()
+            if self.pts_all is None:
+                return None
+            self._select_seg_frames()
+            yield 0.22, "SAM3: running text-prompted segmentation…"
+            yield from self._sam3()
+            yield 0.82, "SAM3: assigning labels to 3-D points…"
+            self._assign_labels()
+            yield 0.86, "SAM3: fitting bounding boxes…"
+            self._fit_aabbs()
+            yield 0.96, "SAM3: saving outputs…"
+            self._save()
+            yield 1.0, "SAM3: complete."
+            return self._final_result()
+        except Exception:
+            traceback.print_exc()
+            raise
+
+
+def run_sam3_pipeline(output_dir, frames, base_dir=None, *, sam3_text: str, **kwargs):
+    """Generator → yields ``(progress, label)`` between stages.
+
+    Same interface and return shape as :func:`run_dino_sam2_pipeline`, but uses
+    SAM3 (single text-prompted call) in place of Grounding DINO + SAM2.
+    """
+    return _Sam3Pipeline(output_dir, frames, base_dir, sam3_text=sam3_text, **kwargs).run()
+
