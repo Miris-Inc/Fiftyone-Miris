@@ -1,6 +1,6 @@
 import { executeOperator } from "@fiftyone/operators";
 import {
-  Box3, Camera, Frustum, Matrix4, PerspectiveCamera, Scene, Vector3,
+  Box3, Camera, FloatType, Frustum, Matrix4, PerspectiveCamera, Scene, Vector3,
   WebGLRenderer, WebGLRenderTarget,
 } from "three";
 import { RIG_CAMERAS, createRigCamera, interpolatePath } from "./cameraRig";
@@ -129,7 +129,9 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
   const w = glCtx.drawingBufferWidth;
   const h = glCtx.drawingBufferHeight;
 
-  const target    = new WebGLRenderTarget(w, h, { depthBuffer: false, stencilBuffer: false });
+  const target      = new WebGLRenderTarget(w, h, { depthBuffer: false, stencilBuffer: false });
+  const targetDepth = new WebGLRenderTarget(w, h, { type: FloatType, depthBuffer: false, stencilBuffer: false });
+  const readbackFloat = new Float32Array(w * h * 4); // reused across depth renders
   const encCanvas = document.createElement("canvas");
   encCanvas.width   = w;
   encCanvas.height  = h;
@@ -231,8 +233,9 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
       if (elapsed >= captureDurationMs) break;
 
       const readback    = new Uint8Array(w * h * 4);
-      const pngItems:  { filename: string; png_base64: string }[] = [];
-      const jsonItems: { filename: string; json_str:   string }[] = [];
+      const pngItems:  { filename: string; png_base64:  string }[] = [];
+      const npyItems:  { filename: string; data_base64: string }[] = [];
+      const jsonItems: { filename: string; json_str:    string }[] = [];
       const stepFrameData: FrameData[] = [];
       const frameStr   = String(captureCount + 1).padStart(4, "0");
       const prevTarget = gl.getRenderTarget();
@@ -263,20 +266,22 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
             captured.push({ camName, renderCam: renderCam as PerspectiveCamera, colorPng: encodePng(enc2d, encCanvas, readback, w, h) });
           }
 
-          // Pass 2 — depth
-          const depthPngs: string[] = new Array(captured.length);
+          // Pass 2 — depth (float32 NPY)
+          const depthNpys: string[] = new Array(captured.length);
           if (captured.length > 0) {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (stream as any)._setRenderMode("SplatDepthColor");
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (stream as any)._setDepthLimits(depthMin, depthMax);
             try {
               for (let ci = 0; ci < captured.length; ci++) {
                 const { renderCam } = captured[ci];
-                gl.setRenderTarget(target);
+                gl.setRenderTarget(targetDepth);
                 gl.setClearColor(0x000000, 0);
                 gl.clear(true, true, false);
                 gl.render(scene, renderCam);
-                gl.readRenderTargetPixels(target, 0, 0, w, h, readback);
-                depthPngs[ci] = encodePng(enc2d, encCanvas, readback, w, h);
+                gl.readRenderTargetPixels(targetDepth, 0, 0, w, h, readbackFloat);
+                depthNpys[ci] = encodeDepthNpy(readbackFloat, w, h);
               }
             } finally {
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -287,10 +292,10 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
           for (let ci = 0; ci < captured.length; ci++) {
             const { camName, renderCam, colorPng } = captured[ci];
             const colorFilename   = buildFilename(assetName, assetUuid, timestamp, "color",  frameStr, "png",  camName);
-            const depthFilename   = buildFilename(assetName, assetUuid, timestamp, "depth",  frameStr, "png",  camName);
+            const depthFilename   = buildFilename(assetName, assetUuid, timestamp, "depth",  frameStr, "npy",  camName);
             const camJsonFilename = buildFilename(assetName, assetUuid, timestamp, "camera", frameStr, "json", camName);
             pngItems.push({ filename: `${folderName}/${colorFilename}`, png_base64: colorPng });
-            pngItems.push({ filename: `${folderName}/${depthFilename}`, png_base64: depthPngs[ci] });
+            npyItems.push({ filename: `${folderName}/${depthFilename}`, data_base64: depthNpys[ci] });
             jsonItems.push({ filename: `${folderName}/${camJsonFilename}`, json_str: JSON.stringify(buildCameraJson(
               renderCam, w, h, assetName, assetUuid, timestamp, frameStr, camName,
               { depth_filename: depthFilename, depth_min: depthMin, depth_max: depthMax, depth_encoding: DEPTH_ENCODING },
@@ -327,27 +332,29 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
           } else {
             const colorPng = encodePng(enc2d, encCanvas, readback, w, h);
 
-            // Pass 2 — depth
-            let depthPng = "";
+            // Pass 2 — depth (float32 NPY)
+            let depthNpy = "";
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (stream as any)._setRenderMode("SplatDepthColor");
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (stream as any)._setDepthLimits(depthMin, depthMax);
             try {
-              gl.setRenderTarget(target);
+              gl.setRenderTarget(targetDepth);
               gl.setClearColor(0x000000, 0);
               gl.clear(true, true, false);
               gl.render(scene, camera);
-              gl.readRenderTargetPixels(target, 0, 0, w, h, readback);
-              depthPng = encodePng(enc2d, encCanvas, readback, w, h);
+              gl.readRenderTargetPixels(targetDepth, 0, 0, w, h, readbackFloat);
+              depthNpy = encodeDepthNpy(readbackFloat, w, h);
             } finally {
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               (stream as any)._setRenderMode(prevMode);
             }
 
             const colorFilename   = buildFilename(assetName, assetUuid, timestamp, "color",  frameStr, "png");
-            const depthFilename   = buildFilename(assetName, assetUuid, timestamp, "depth",  frameStr, "png");
+            const depthFilename   = buildFilename(assetName, assetUuid, timestamp, "depth",  frameStr, "npy");
             const camJsonFilename = buildFilename(assetName, assetUuid, timestamp, "camera", frameStr, "json");
             pngItems.push({ filename: `${folderName}/${colorFilename}`, png_base64: colorPng });
-            pngItems.push({ filename: `${folderName}/${depthFilename}`, png_base64: depthPng });
+            npyItems.push({ filename: `${folderName}/${depthFilename}`, data_base64: depthNpy });
             jsonItems.push({ filename: `${folderName}/${camJsonFilename}`, json_str: JSON.stringify(buildCameraJson(
               camera as PerspectiveCamera, w, h, assetName, assetUuid, timestamp, frameStr, undefined,
               { depth_filename: depthFilename, depth_min: depthMin, depth_max: depthMax, depth_encoding: DEPTH_ENCODING },
@@ -369,7 +376,7 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
       gl.setRenderTarget(prevTarget);
 
       if (pngItems.length > 0) {
-        const batchResult = await executeOperatorAndReturn(SAVE_BATCH_OP, { png_items: pngItems, json_items: jsonItems });
+        const batchResult = await executeOperatorAndReturn(SAVE_BATCH_OP, { png_items: pngItems, npy_items: npyItems, json_items: jsonItems });
         if (batchResult.status === "error") {
           await executeOperator("@voxel51/operators/notify", {
             message: `Frame ${frameStr}: batch save failed — ${batchResult.error as string}`,
@@ -428,6 +435,7 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
   } finally {
     cancelAnimationFrame(rafHandle);
     target.dispose();
+    targetDepth.dispose();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (stream as any)._setRenderMode?.(prevMode);
   }
@@ -532,6 +540,42 @@ function buildCameraJson(
     clip_far: cam.far ?? 2000,
     ...(depthMeta ?? {}),
   };
+}
+
+function encodeDepthNpy(readbackFloat: Float32Array, w: number, h: number): string {
+  // Extract R channel from RGBA float32 readback (WebGL writes depth to all channels).
+  const depth = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) depth[i] = readbackFloat[i * 4]!;
+
+  // Flip rows: WebGL origin is bottom-left; NumPy convention is top-left.
+  const flipped = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    flipped.set(depth.subarray(y * w, (y + 1) * w), (h - 1 - y) * w);
+  }
+
+  // Build a NumPy v1.0 file: magic(6) + version(2) + header_len(2) + header + data.
+  // Total of (10 + header_len) must be a multiple of 64.
+  const header = `{'descr': '<f4', 'fortran_order': False, 'shape': (${h}, ${w}), }`;
+  const prefixLen = 10;
+  const totalPrefix = Math.ceil((prefixLen + header.length + 1) / 64) * 64;
+  const headerLen = totalPrefix - prefixLen;
+  const headerPadded = header.padEnd(headerLen - 1, " ") + "\n";
+
+  const out = new Uint8Array(totalPrefix + flipped.byteLength);
+  out[0]=0x93; out[1]=0x4e; out[2]=0x55; out[3]=0x4d; out[4]=0x50; out[5]=0x59; // \x93NUMPY
+  out[6]=0x01; out[7]=0x00;                                                       // version 1.0
+  out[8]=headerLen & 0xff; out[9]=(headerLen >> 8) & 0xff;                        // header_len LE
+  for (let i = 0; i < headerPadded.length; i++) out[10 + i] = headerPadded.charCodeAt(i);
+  out.set(new Uint8Array(flipped.buffer), totalPrefix);
+
+  // Base64-encode in 8 KB chunks to avoid call-stack overflow on large buffers.
+  const chunkSize = 8192;
+  const parts: string[] = [];
+  for (let i = 0; i < out.length; i += chunkSize) {
+    // eslint-disable-next-line prefer-spread
+    parts.push(String.fromCharCode.apply(null, out.subarray(i, i + chunkSize) as unknown as number[]));
+  }
+  return btoa(parts.join(""));
 }
 
 function encodePng(
