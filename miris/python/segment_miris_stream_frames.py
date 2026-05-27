@@ -8,6 +8,17 @@ from .. import _captures_dir
 from .segmentation import run_dino_sam2_pipeline
 
 
+def _fail(ctx, message: str, exc: BaseException | None = None, variant: str = "error"):
+    """Yield an error notification then raise, so delegated tasks show as failed."""
+    yield ctx.trigger("@voxel51/operators/notify", params={
+        "message": message,
+        "variant": variant,
+    })
+    if exc is not None:
+        raise exc
+    raise RuntimeError(message)
+
+
 class SegmentMirisStreamFrames(foo.Operator):
     @property
     def config(self):
@@ -16,6 +27,9 @@ class SegmentMirisStreamFrames(foo.Operator):
             label="Miris: Segment stream frames and generate labels",
             unlisted=True,
             execute_as_generator=True,
+            allow_immediate_execution=True,
+            allow_delegated_execution=True,
+            default_choice_to_delegated=True,
         )
 
     def resolve_input(self, _ctx):
@@ -42,11 +56,8 @@ class SegmentMirisStreamFrames(foo.Operator):
         dino_text = ctx.params["dino_text"]
 
         if not frames:
-            yield ctx.trigger("@voxel51/operators/notify", params={
-                "message": f'Segmentation failed for "{asset_name}" — no frames captured.',
-                "variant": "error",
-            })
-            return
+            yield from _fail(ctx, f'Segmentation failed for "{asset_name}" — no frames captured.')
+            return  # unreachable
 
         base_dir = pathlib.Path(_captures_dir(dataset_name))
 
@@ -93,11 +104,8 @@ def _run_pipeline_generator(ctx, frames, base_dir, output_dir, asset_name, asset
         import traceback
         yield ctx.log(f"[segment] CRASH: {type(exc).__name__}: {exc}")
         yield ctx.log(f"[segment] traceback:\n{traceback.format_exc()}")
-        yield ctx.trigger("@voxel51/operators/notify", params={
-            "message": f'Segmentation crashed for "{asset_name}": {type(exc).__name__}: {exc}',
-            "variant": "error",
-        })
-        return
+        yield from _fail(ctx, f'Segmentation crashed for "{asset_name}": {type(exc).__name__}: {exc}', exc)
+        return  # unreachable
 
     yield ctx.log(
         f"[segment] pipeline returned: type={type(results).__name__} "
@@ -111,15 +119,13 @@ def _run_pipeline_generator(ctx, frames, base_dir, output_dir, asset_name, asset
             f"nothing to save. Usually means DINO/SAM2 found nothing "
             f"matching the text prompt."
         )
-        yield ctx.trigger("@voxel51/operators/notify", params={
-            "message": (
-                f'No detections found for "{asset_name}". '
-                f"DINO found no objects matching the text prompt, or the depth cloud "
-                f"could not be built (check the console for details)."
-            ),
-            "variant": "warning",
-        })
-        return
+        yield from _fail(ctx,
+            f'No detections found for "{asset_name}". '
+            f"DINO found no objects matching the text prompt, or the depth cloud "
+            f"could not be built (check the console for details).",
+            variant="warning",
+        )
+        return  # unreachable
 
     yield ctx.log(
         f"[segment] building {len(results.get('detections', []))} detections"
@@ -218,6 +224,9 @@ class SegmentMirisStreamFramesFromFolder(foo.Operator):
             label="Miris: Segment stream frames from folder",
             unlisted=False,
             execute_as_generator=True,
+            allow_immediate_execution=True,
+            allow_delegated_execution=True,
+            default_choice_to_delegated=True,
         )
 
     def resolve_input(self, _ctx):
@@ -241,20 +250,14 @@ class SegmentMirisStreamFramesFromFolder(foo.Operator):
         base_dir = pathlib.Path(ctx.params["frames_folder"])
 
         if not ctx.current_sample:
-            yield ctx.trigger("@voxel51/operators/notify", params={
-                "message": "No sample is currently loaded. Open a sample in the modal before running this operator.",
-                "variant": "error",
-            })
-            return
+            yield from _fail(ctx, "No sample is currently loaded. Open a sample in the modal before running this operator.")
+            return  # unreachable
 
         sample = ctx.dataset[ctx.current_sample]
         asset_uuid = sample.get_field("miris_asset_uuid") or ""
         if not asset_uuid:
-            yield ctx.trigger("@voxel51/operators/notify", params={
-                "message": "The current sample does not have a miris_asset_uuid field. This operator can only be run on Miris samples.",
-                "variant": "error",
-            })
-            return
+            yield from _fail(ctx, "The current sample does not have a miris_asset_uuid field. This operator can only be run on Miris samples.")
+            return  # unreachable
 
         asset_name = sample.get_field("miris_asset_name") or "unknown"
 
@@ -268,17 +271,16 @@ class SegmentMirisStreamFramesFromFolder(foo.Operator):
                 "color_filename": color_file.name,
                 "camera_json_filename": camera_file.name,
             }
-            depth_file = base_dir / (base + "_depth.png")
-            if depth_file.exists():
-                entry["depth_filename"] = depth_file.name
+            for _depth_ext in ("_depth.npy", "_depth.png"):
+                depth_file = base_dir / (base + _depth_ext)
+                if depth_file.exists():
+                    entry["depth_filename"] = depth_file.name
+                    break
             frames.append(entry)
 
         if not frames:
-            yield ctx.trigger("@voxel51/operators/notify", params={
-                "message": f'Segmentation failed for "{asset_name}" — no frames found in folder.',
-                "variant": "error",
-            })
-            return
+            yield from _fail(ctx, f'Segmentation failed for "{asset_name}" — no frames found in folder.')
+            return  # unreachable
 
         output_dir = base_dir / "segmentation"
         output_dir.mkdir(parents=True, exist_ok=True)

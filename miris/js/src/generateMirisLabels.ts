@@ -4,7 +4,6 @@ import * as fos from "@fiftyone/state";
 import { runCapture, sanitizeName, buildRunFolder, CaptureMode, type CaptureConfig } from "./captureStreamFrames";
 import { setupOffscreenScene } from "./offscreenScene";
 import { DEFAULT_VIEWER_KEY } from "./syncMirisAssets";
-import { executeOperatorAndReturn } from "./utils";
 import { readWaypointsFromSample } from "./waypoints";
 
 const PLUGIN_NAME = "@miris-inc/voxel51";
@@ -206,13 +205,14 @@ async function runPipeline(args: PipelineArgs): Promise<void> {
     console.log("[GenerateMirisLabels] capture done,", frameData.length, "frame entries; starting segmentation");
 
     // Phase 2 — segmentation (Python generator emits per-frame set_progress)
-    await executeOperatorAndReturn(`${PLUGIN_NAME}/segment_miris_stream_frames`, {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (executeOperator as any)(`${PLUGIN_NAME}/segment_miris_stream_frames`, {
       frames: frameData,
       asset_name: args.assetName,
       asset_uuid: args.assetUuid,
       dataset_name: args.datasetName,
       dino_text: args.dinoText,
-    });
+    }, { requestDelegation: true });
   } finally {
     off.dispose();
   }
