@@ -24,9 +24,9 @@ const DEPTH_ENCODING = "single_r";
  *                  least angular-coverage accumulated so far.
  */
 export enum CaptureMode {
-  Rig           = "rig",
   NearestPoi    = "nearest_poi",
   CoverageGreedy = "coverage_greedy",
+  Rig           = "rig",
 }
 
 export interface FrameData {
