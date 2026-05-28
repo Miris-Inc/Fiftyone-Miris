@@ -1,5 +1,5 @@
 /**
- * Type declarations for @fiftyone/* packages.
+ * Type declarations for @fiftyone/* packages and runtime-provided globals.
  *
  * These packages are not published to npm. They are provided at runtime
  * by the FiftyOne App. These stubs let TypeScript compile the plugin
@@ -15,12 +15,16 @@ declare module "@fiftyone/operators" {
       label: string;
       unlisted?: boolean;
       dynamic?: boolean;
+      execute_as_generator?: boolean;
     });
   }
 
   export interface ExecutionContext {
     params: Record<string, unknown>;
-    dataset: unknown;
+    dataset: { name: string } | null;
+    hooks: Record<string, unknown>;
+    /** Queue an operator to run after this execute() returns. */
+    trigger(operatorUri: string, params?: Record<string, unknown>): void;
   }
 
   export function executeOperator(
@@ -37,6 +41,20 @@ declare module "@fiftyone/operators" {
         required?: boolean;
         default?: string;
       }): void;
+      int(name: string, options?: {
+        label?: string;
+        description?: string;
+        required?: boolean;
+        default?: number;
+        min?: number;
+        max?: number;
+      }): void;
+      enum(name: string, values: string[], options?: {
+        label?: string;
+        description?: string;
+        required?: boolean;
+        default?: string;
+      }): void;
     }
     class Property {
       constructor(type: types.Object);
@@ -45,6 +63,7 @@ declare module "@fiftyone/operators" {
 
   export abstract class Operator {
     abstract get config(): OperatorConfig;
+    useHooks?(): Record<string, unknown>;
     resolveInput(ctx: ExecutionContext): types.Property | void;
     execute(ctx: ExecutionContext): Promise<void> | void;
   }
@@ -55,3 +74,14 @@ declare module "@fiftyone/operators" {
   ): void;
 }
 
+declare module "@fiftyone/state" {
+  export interface ModalSample {
+    sample: Record<string, unknown> | null;
+  }
+  export const modalSample: unknown;
+  export const datasetName: unknown;
+}
+
+declare module "recoil" {
+  export function useRecoilValue<T>(state: unknown): T;
+}
