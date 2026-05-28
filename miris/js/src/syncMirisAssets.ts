@@ -8,7 +8,7 @@ const DEFAULT_VIEWER_KEY = "4YIGMPUj5-fL8n0jkp1kQpJktss_UaBDMW9jwJb08f4";
 async function fetchMirisAssets(viewerKey: string) {
   const scene = await getMirisScene();
   scene.viewerKey = viewerKey;
-  return scene.fetchAssets("Kellan Cartledge");
+  return scene.fetchAssets();
 }
 
 class SyncMirisAssets extends Operator {
