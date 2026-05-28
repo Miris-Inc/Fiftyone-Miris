@@ -114,6 +114,10 @@ def _run_pipeline_generator(
     yield ctx.log(
         f"[segment] output_dir={output_dir} frames={len(frames)} (all) method={method}"
     )
+    # visualize=True dumps per-frame mask PNGs, projected-box PNGs, and a
+    # combined PLY point cloud into ``output_dir`` for offline inspection
+    # (open with MeshLab / CloudCompare / etc.). Cheap relative to inference,
+    # so leave it on by default.
     if method == _METHOD_SAM3:
         gen = run_sam3_pipeline(
             output_dir=output_dir,
@@ -122,7 +126,7 @@ def _run_pipeline_generator(
             sam3_text=dino_text,
             cam_stride=1,
             seg_frames=0,
-            visualize=False,
+            visualize=True,
         )
         backend_name = "SAM3"
     else:
@@ -133,7 +137,7 @@ def _run_pipeline_generator(
             dino_text=dino_text,
             cam_stride=1,
             seg_frames=0,
-            visualize=False,
+            visualize=True,
         )
         backend_name = "DINO/SAM2"
 

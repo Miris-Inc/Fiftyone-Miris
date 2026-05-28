@@ -5,13 +5,25 @@ import fiftyone as fo
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
 
-# Explicit submodule import. `fo.MirisStream` can fail to resolve when
-# `fiftyone` ends up as a namespace package (e.g. site-packages/fiftyone
-# contributed only by fiftyone-brain/db has no __init__.py to run, so
-# attributes from fiftyone/__public__.py never get attached). Pulling
-# MirisStream directly from its module bypasses the attribute lookup —
-# the submodule itself resolves via namespace __path__ regardless.
-from fiftyone.core.threed.miris_stream import MirisStream
+# MirisStream used to live in fiftyone core
+# (`fiftyone.core.threed.miris_stream`) on an older internal fork. The current
+# `feature/expose-fo3d-nodes-to-plugins` branch removed that module and replaced
+# it with the generic `PluginNode` mechanism: the Python side constructs a
+# `PluginNode(plugin_type="mirisstream", data=...)` and the JS bundle registers
+# a renderer for the same `typeName`. We prefer the new API but keep the legacy
+# import as a fallback so older FiftyOne builds still work.
+try:
+    from fiftyone.core.threed.miris_stream import MirisStream  # type: ignore
+    _HAS_MIRIS_STREAM = True
+except Exception:  # pragma: no cover - depends on fiftyone build
+    MirisStream = None  # type: ignore
+    _HAS_MIRIS_STREAM = False
+
+try:
+    from fiftyone.core.threed import PluginNode  # type: ignore
+except Exception:  # pragma: no cover
+    PluginNode = None  # type: ignore
+
 from fiftyone.utils.utils3d import OrthographicProjectionMetadata
 
 
@@ -66,13 +78,29 @@ def _write_fo3d_scene(uuid: str, viewer_key: str, dataset_name: str) -> str:
     fo3d_path = os.path.join(dest_dir, f"{uuid}.fo3d")
 
     scene = fo.Scene()
-    scene.add(
-        MirisStream(
-            name=uuid,
-            asset_uuid=uuid,
-            viewer_key=viewer_key or None,
+    if _HAS_MIRIS_STREAM and MirisStream is not None:
+        scene.add(
+            MirisStream(
+                name=uuid,
+                asset_uuid=uuid,
+                viewer_key=viewer_key or None,
+            )
         )
-    )
+    elif PluginNode is not None:
+        # New FiftyOne API: the JS bundle registers a renderer for typeName
+        # "mirisstream" (see `@miris/viewer`'s usage as the canonical example).
+        scene.add(
+            PluginNode(
+                name=uuid,
+                plugin_type="mirisstream",
+                data={"streamUuid": uuid, "viewerKey": viewer_key or None},
+            )
+        )
+    else:
+        raise RuntimeError(
+            "Neither MirisStream nor PluginNode is available in this "
+            "FiftyOne build. Cannot author a Miris fo3d scene."
+        )
     scene.write(fo3d_path)
     return fo3d_path
 
