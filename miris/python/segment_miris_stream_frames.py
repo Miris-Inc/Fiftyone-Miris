@@ -135,7 +135,10 @@ def _run_pipeline_generator(ctx, frames, base_dir, output_dir, asset_name, asset
             label=d["label"],
             location=d["center"],
             dimensions=d["dimensions"],
-            rotation=[0.0, 0.0, 0.0],
+            # Per-instance Euler XYZ (radians). For gravity-locked yaw OBBs
+            # only the up-axis component is non-zero; an empty/missing field
+            # falls back to identity for compatibility with older pipelines.
+            rotation=d.get("rotation", [0.0, 0.0, 0.0]),
         )
         for d in results["detections"]
     ]
