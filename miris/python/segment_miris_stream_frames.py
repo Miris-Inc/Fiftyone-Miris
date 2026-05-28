@@ -90,7 +90,7 @@ def _run_pipeline_generator(ctx, frames, base_dir, output_dir, asset_name, asset
         dino_text=dino_text,
         cam_stride=1,
         seg_frames=0,
-        visualize=False,
+        visualize=True,
     )
 
     results = None
