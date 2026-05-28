@@ -270,9 +270,12 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
           const depthNpys: string[] = new Array(captured.length);
           if (captured.length > 0) {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (stream as any)._setRenderMode("SplatDepthColor");
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (stream as any)._setDepthLimits(depthMin, depthMax);
+            const streamAny = stream as any;
+
+            streamAny._setRenderMode("SplatDepthColor");
+            if (typeof streamAny._setDepthLimits === "function") {
+              streamAny._setDepthLimits(depthMin, depthMax);
+            }
             try {
               for (let ci = 0; ci < captured.length; ci++) {
                 const { renderCam } = captured[ci];
@@ -335,9 +338,11 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
             // Pass 2 — depth (float32 NPY)
             let depthNpy = "";
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (stream as any)._setRenderMode("SplatDepthColor");
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (stream as any)._setDepthLimits(depthMin, depthMax);
+            const streamAny = stream as any;
+            streamAny._setRenderMode("SplatDepthColor");
+            if (typeof streamAny._setDepthLimits === "function") {
+              streamAny._setDepthLimits(depthMin, depthMax);
+            }
             try {
               gl.setRenderTarget(targetDepth);
               gl.setClearColor(0x000000, 0);
@@ -346,8 +351,7 @@ export async function runCapture(cfg: CaptureConfig): Promise<FrameData[]> {
               gl.readRenderTargetPixels(targetDepth, 0, 0, w, h, readbackFloat);
               depthNpy = encodeDepthNpy(readbackFloat, w, h);
             } finally {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              (stream as any)._setRenderMode(prevMode);
+              streamAny._setRenderMode(prevMode);
             }
 
             const colorFilename   = buildFilename(assetName, assetUuid, timestamp, "color",  frameStr, "png");
