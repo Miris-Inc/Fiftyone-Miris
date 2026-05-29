@@ -215,7 +215,7 @@ def _aabb_corners(aabb: dict) -> np.ndarray:
     """8 corners (8, 3) ordered to match ``_BOX_EDGES``.
 
     Prefers the tight OBB corners (``obb_corners_world``) when the dict was
-    produced by ``_fit_obb_yaw``; falls back to the Cartesian product of
+    produced by ``_fit_box``; falls back to the Cartesian product of
     ``world_min``/``world_max`` for legacy AABB-only dicts.
     """
     if "obb_corners_world" in aabb:

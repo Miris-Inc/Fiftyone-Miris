@@ -13,100 +13,64 @@ from .geometry import (
     _base_label,
 )
 
-def _fit_aabb(pts: np.ndarray, percentile_trim: float = 0.5) -> dict:
-    """Plain world-axis-aligned bounding box. Rotation is identity."""
-    lo = np.percentile(pts, percentile_trim, axis=0)
-    hi = np.percentile(pts, 100.0 - percentile_trim, axis=0)
-    center = (lo + hi) / 2.0
-    size = hi - lo
-    # 8 corners in the order geometry._aabb_corners uses, so callers that
-    # read ``obb_corners_world`` get a consistent vertex ordering whether the
-    # box was fit as an AABB or an OBB.
-    corners = np.array([
-        [lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]],
-        [lo[0], hi[1], lo[2]], [hi[0], hi[1], lo[2]],
-        [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]],
-        [lo[0], hi[1], hi[2]], [hi[0], hi[1], hi[2]],
-    ])
-    return {
-        "world_min": lo.tolist(),
-        "world_max": hi.tolist(),
-        "center": center.tolist(),
-        "size": size.tolist(),
-        "rotation": [0.0, 0.0, 0.0],
-        "obb_corners_world": corners.tolist(),
-        "obb_yaw": 0.0,
-        "num_points": int(pts.shape[0]),
-    }
-
-
-def _fit_obb_yaw(
+def _fit_box(
     pts: np.ndarray,
     up_axis: int = 1,
     percentile_trim: float = 0.5,
 ) -> dict:
-    """Oriented bounding box with one axis locked to world-up (gravity-aligned yaw OBB).
-
+    """Fit a gravity-locked yaw OBB to ``pts``.
     Algorithm:
       1. Split coords into horizontal (2 axes) + vertical (``up_axis``).
-      2. 2-D PCA on horizontal points → yaw angle of the larger-variance axis.
-      3. De-rotate horizontal points by −yaw → percentile-trim min/max give the
-         local horizontal extents (length × width).
-      4. Vertical extent is straight percentile-trim min/max along ``up_axis``.
-      5. Compose into a dict that's a strict superset of ``_fit_aabb``'s shape
-         so all downstream code keeps working. ``world_min``/``world_max`` hold
-         the AABB of the rotated OBB (used only by the conservative overlap
-         check); ``center``/``size`` are the *local* OBB centre and extents
-         (what FiftyOne's ``Detection`` renders); ``rotation`` is Euler XYZ in
-         radians with the yaw placed at index ``up_axis``; ``obb_corners_world``
-         carries the 8 tight world-space corners for reprojection &
-         visualization.
-
-    Falls back to an axis-aligned box (rotation 0) when horizontal variance is
-    degenerate.
+      2. 2-D PCA on the horizontal points → yaw of the larger-variance axis.
+         If the horizontal covariance is degenerate (<2 points, all coincident,
+         or colinear with one axis), yaw defaults to 0 and the result is a
+         plain world-axis-aligned box — the natural degenerate case of the
+         yaw OBB.
+      3. De-rotate horizontal points by −yaw → percentile-trim min/max give
+         the local horizontal extents (length × width). Vertical extent is the
+         straight percentile-trim min/max along ``up_axis``.
+      4. Compose into a dict with ``world_min``/``world_max`` (the AABB of the
+         rotated OBB, used only by the conservative overlap check),
+         ``center``/``size`` (local OBB centre and extents — what FiftyOne's
+         ``Detection`` renders), ``rotation`` (Euler XYZ in radians with the
+         yaw placed at index ``up_axis``), and ``obb_corners_world`` (the 8
+         tight world-space corners for reprojection & visualization).
     """
-    if pts.shape[0] < 2:
-        return _fit_aabb(pts, percentile_trim)
-
     horiz_axes = [a for a in (0, 1, 2) if a != up_axis]
     h = pts[:, horiz_axes]                       # (N, 2)
     v = pts[:, up_axis]                          # (N,)
-
     h_centroid = h.mean(axis=0)
     hc = h - h_centroid                          # centred
-
-    # 2x2 covariance; eigh returns ascending eigenvalues → take last for
-    # the larger-variance ("length") axis.
-    cov = np.cov(hc.T)
-    if not np.all(np.isfinite(cov)) or np.linalg.norm(cov) < 1e-12:
-        return _fit_aabb(pts, percentile_trim)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    length_axis = eigvecs[:, -1]                 # unit vector in horiz plane
-
-    yaw = float(np.arctan2(length_axis[1], length_axis[0]))
-
+    # 2x2 horizontal covariance; eigh returns ascending eigenvalues → take
+    # last for the larger-variance ("length") axis. Degenerate clusters
+    # (<2 pts, coincident, or colinear) fall through with yaw=0 — the
+    # remaining math then produces an axis-aligned box naturally (R2 becomes
+    # identity, local extents == world extents).
+    yaw = 0.0
+    if pts.shape[0] >= 2:
+        cov = np.cov(hc.T)
+        if np.all(np.isfinite(cov)) and np.linalg.norm(cov) >= 1e-12:
+            _, eigvecs = np.linalg.eigh(cov)
+            length_axis = eigvecs[:, -1]
+            yaw = float(np.arctan2(length_axis[1], length_axis[0]))
     # De-rotate horizontal coords by −yaw so length axis aligns with local +X.
     c, s = np.cos(-yaw), np.sin(-yaw)
     R2 = np.array([[c, -s], [s, c]])
     local_h = hc @ R2.T                          # (N, 2): local (length, width)
-
     lo_l = float(np.percentile(local_h[:, 0], percentile_trim))
     hi_l = float(np.percentile(local_h[:, 0], 100.0 - percentile_trim))
     lo_w = float(np.percentile(local_h[:, 1], percentile_trim))
     hi_w = float(np.percentile(local_h[:, 1], 100.0 - percentile_trim))
     lo_v = float(np.percentile(v, percentile_trim))
     hi_v = float(np.percentile(v, 100.0 - percentile_trim))
-
     local_center_h = np.array([(lo_l + hi_l) / 2.0, (lo_w + hi_w) / 2.0])
     half_l, half_w = (hi_l - lo_l) / 2.0, (hi_w - lo_w) / 2.0
     vertical_center = (lo_v + hi_v) / 2.0
     half_v = (hi_v - lo_v) / 2.0
-
     # Local → world horizontal rotation (by +yaw).
     c2, s2 = np.cos(yaw), np.sin(yaw)
     R2_inv = np.array([[c2, -s2], [s2, c2]])
     world_center_h = h_centroid + local_center_h @ R2_inv.T
-
     # Compose world-space ``center`` & local ``size`` in (X, Y, Z) order.
     center = np.empty(3)
     size = np.empty(3)
@@ -115,7 +79,6 @@ def _fit_obb_yaw(
         size[axis] = 2.0 * (half_l if slot == 0 else half_w)
     center[up_axis] = vertical_center
     size[up_axis] = 2.0 * half_v
-
     # 8 OBB corners in world space.
     corners = np.zeros((8, 3))
     for i, (sl, sw, sv) in enumerate([
@@ -129,23 +92,20 @@ def _fit_obb_yaw(
         for slot, axis in enumerate(horiz_axes):
             corners[i, axis] = world_xy[slot]
         corners[i, up_axis] = vertical_center + sv * half_v
-
     # AABB of the rotated OBB — kept for the conservative overlap check.
     world_min = corners.min(axis=0)
     world_max = corners.max(axis=0)
-
     # FiftyOne Detection.rotation is Euler XYZ in radians (Three.js right-handed,
     # Y-up). Our 2-D ``yaw`` is measured in the horizontal plane treated as a
     # standard 2-D plane: +yaw rotates +X -> +(second horiz axis). For up_axis=1
     # that second axis is world +Z, but a positive Euler-Y rotation in a
     # right-handed Y-up frame takes +X -> -Z (Ry(theta)*(1,0,0) = (cos, 0, -sin)).
     # So the FiftyOne rotation must be the negated yaw to match the OBB we
-    # built. (Our ``obb_corners_world`` is internally consistent with +yaw and
-    # is unaffected -- only the Detection.rotation needs the flip.)
+    # built. (``obb_corners_world`` is internally consistent with +yaw and is
+    # unaffected -- only the Detection.rotation needs the flip.)
     fo_yaw = -yaw if up_axis == 1 else yaw
     rotation = [0.0, 0.0, 0.0]
     rotation[up_axis] = fo_yaw
-
     return {
         "world_min": world_min.tolist(),
         "world_max": world_max.tolist(),
@@ -156,19 +116,6 @@ def _fit_obb_yaw(
         "obb_yaw": yaw,
         "num_points": int(pts.shape[0]),
     }
-
-
-def _fit_box(
-    pts: np.ndarray,
-    percentile_trim: float = 0.5,
-    obb: bool = True,
-    up_axis: int = 1,
-) -> dict:
-    """Dispatch: gravity-locked yaw OBB when ``obb=True``, else plain AABB."""
-    if obb:
-        return _fit_obb_yaw(pts, up_axis=up_axis, percentile_trim=percentile_trim)
-    return _fit_aabb(pts, percentile_trim)
-
 
 def _dbscan_keep_largest(
     pts_label: np.ndarray,
@@ -204,7 +151,6 @@ def fit_all_aabbs(
     dbscan_eps: Optional[float] = None,
     dbscan_min_samples: Optional[int] = None,
     max_box_size: float = 0.0,
-    obb: bool = True,
     up_axis: int = 1,
 ) -> tuple[dict, dict]:
     """One global box + one box per instance.
@@ -214,16 +160,14 @@ def fit_all_aabbs(
     (table pixels around the object form sparse clusters that lose the size contest).
     ``max_box_size > 0`` additionally drops instances whose largest box dimension exceeds it.
 
-    When ``obb=True`` (default), per-label boxes are gravity-locked yaw OBBs
-    (rotation about ``up_axis`` only) — much tighter for objects sitting
-    diagonally vs world axes. ``up_axis ∈ {0, 1, 2}`` selects X/Y/Z as world
-    up; default ``1`` matches FiftyOne's Y-up convention.
+    Both the global box and per-label boxes are fit with :func:`_fit_box`
+    (gravity-locked yaw OBB, rotation about ``up_axis`` only). ``up_axis ∈
+    {0, 1, 2}`` selects X/Y/Z as world up; default ``1`` matches FiftyOne's
+    Y-up convention.
     """
     use_dbscan = dbscan_eps is not None and dbscan_min_samples is not None
 
-    # The global box stays a plain AABB — it's used as a world-space cropping
-    # frustum, not a per-object render target, so rotating it adds no value.
-    global_aabb = _fit_aabb(pts, percentile_trim)
+    global_aabb = _fit_box(pts, up_axis=up_axis, percentile_trim=percentile_trim)
     label_aabbs: dict[str, dict] = {}
 
     for lid, name in enumerate(label_names):
@@ -240,7 +184,7 @@ def fit_all_aabbs(
                 continue
             pts_label = kept
 
-        aabb = _fit_box(pts_label, percentile_trim, obb=obb, up_axis=up_axis)
+        aabb = _fit_box(pts_label, up_axis=up_axis, percentile_trim=percentile_trim)
         if max_box_size > 0 and max(aabb["size"]) > max_box_size:
             print(
                 f"  [filter] '{name}' dropped — max dim "
