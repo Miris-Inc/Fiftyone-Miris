@@ -1,0 +1,24 @@
+name: miris-inc/fiftyone-demo-assets
+type: dataset
+author: Miris Inc.
+version: 1.0.0
+url: https://github.com/Miris-Inc/Fiftyone-Miris/tree/develop/dataset
+source: https://miris.com
+license: Apache-2.0
+description: >
+  A curated demo dataset of Miris 3D assets for FiftyOne. Each sample is a
+  `.fo3d` scene referencing a first-class `MirisStream` node (streamed and
+  rendered natively by FiftyOne core's looker-3d), with an orthographic
+  projection thumbnail (`miris_opm`) so the grid renders a 2D preview. Custom
+  fields carry the Miris asset UUID, name, and source thumbnail URL.
+fiftyone:
+  version: ">=1.0"
+supports_partial_downloads: false
+tags:
+  - 3d
+  - miris
+  - point-cloud
+  - demo
+# Informational only; the real count is reported by download_and_prepare().
+# Update this after exporting the snapshot (see README.md).
+size_samples: 6
