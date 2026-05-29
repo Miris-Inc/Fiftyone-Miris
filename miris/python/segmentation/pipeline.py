@@ -267,7 +267,12 @@ class _Pipeline:
             return None
         return {
             "detections": [
-                {"label": name, "center": aabb["center"], "dimensions": aabb["size"]}
+                {
+                    "label": name,
+                    "center": aabb["center"],
+                    "dimensions": aabb["size"],
+                    "rotation": aabb.get("rotation", [0.0, 0.0, 0.0]),
+                }
                 for name, aabb in self.label_aabbs.items()
             ]
         }

@@ -212,7 +212,14 @@ def _project_points_into_frame(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _aabb_corners(aabb: dict) -> np.ndarray:
-    """8 corners (8, 3) ordered to match ``_BOX_EDGES`` — Cartesian product of (xmn|xmx)×(ymn|ymx)×(zmn|zmx)."""
+    """8 corners (8, 3) ordered to match ``_BOX_EDGES``.
+
+    Prefers the tight OBB corners (``obb_corners_world``) when the dict was
+    produced by ``_fit_box``; falls back to the Cartesian product of
+    ``world_min``/``world_max`` for legacy AABB-only dicts.
+    """
+    if "obb_corners_world" in aabb:
+        return np.asarray(aabb["obb_corners_world"], dtype=np.float64)
     mn = np.asarray(aabb["world_min"], dtype=np.float64)
     mx = np.asarray(aabb["world_max"], dtype=np.float64)
     return np.array([
