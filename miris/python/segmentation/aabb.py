@@ -134,10 +134,17 @@ def _fit_obb_yaw(
     world_min = corners.min(axis=0)
     world_max = corners.max(axis=0)
 
-    # FiftyOne Detection.rotation is Euler XYZ in radians; only yaw is nonzero,
-    # placed at the up-axis index.
+    # FiftyOne Detection.rotation is Euler XYZ in radians (Three.js right-handed,
+    # Y-up). Our 2-D ``yaw`` is measured in the horizontal plane treated as a
+    # standard 2-D plane: +yaw rotates +X -> +(second horiz axis). For up_axis=1
+    # that second axis is world +Z, but a positive Euler-Y rotation in a
+    # right-handed Y-up frame takes +X -> -Z (Ry(theta)*(1,0,0) = (cos, 0, -sin)).
+    # So the FiftyOne rotation must be the negated yaw to match the OBB we
+    # built. (Our ``obb_corners_world`` is internally consistent with +yaw and
+    # is unaffected -- only the Detection.rotation needs the flip.)
+    fo_yaw = -yaw if up_axis == 1 else yaw
     rotation = [0.0, 0.0, 0.0]
-    rotation[up_axis] = yaw
+    rotation[up_axis] = fo_yaw
 
     return {
         "world_min": world_min.tolist(),
